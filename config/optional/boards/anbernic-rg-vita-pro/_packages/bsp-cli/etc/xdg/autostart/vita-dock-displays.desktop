@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=RG Vita Pro dock displays
+Comment=Re-apply dual MST layout after USB-C dock settles
+Exec=/usr/bin/vita-dock-displays
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

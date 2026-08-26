@@ -5,7 +5,7 @@ BOARDFAMILY="rk35xx"
 BOOTCONFIG="generic-rk3576_defconfig"
 BOARD_MAINTAINER="crackerjacques"
 INTRODUCED="2026"
-KERNEL_TARGET="edge"
+KERNEL_TARGET="vendor,edge"
 KERNEL_TEST_TARGET="edge"
 
 # Dependencies of the board helpers (vita-pad2key, vita-jack-switch, vita-screen)
@@ -62,6 +62,8 @@ function post_family_tweaks__anbernic_rg_vita_pro_helpers() {
 		"${SDCARD}/etc/systemd/system/multi-user.target.wants/vita-pad2key.service"
 	ln -sf /etc/systemd/system/vita-offcharge.service \
 		"${SDCARD}/etc/systemd/system/multi-user.target.wants/vita-offcharge.service"
+	ln -sf /etc/systemd/system/vita-panel-touch-fix.service \
+		"${SDCARD}/etc/systemd/system/multi-user.target.wants/vita-panel-touch-fix.service"
 	mkdir -p "${SDCARD}/etc/systemd/system/reboot.target.wants"
 	ln -sf /etc/systemd/system/vita-offcharge-reboot-marker.service \
 		"${SDCARD}/etc/systemd/system/reboot.target.wants/vita-offcharge-reboot-marker.service"
@@ -70,6 +72,9 @@ function post_family_tweaks__anbernic_rg_vita_pro_helpers() {
 	# Mobile shell's legacy GL calls fail and the task switcher livelocks.
 	grep -q '^KWIN_COMPOSE=' "${SDCARD}/etc/environment" 2>/dev/null || \
 		echo 'KWIN_COMPOSE=O2ES' >> "${SDCARD}/etc/environment"
+
+	# Netplan warns (and NM integration misbehaves) if wifi yaml is world-readable.
+	chmod 600 "${SDCARD}/etc/netplan/"*.yaml 2>/dev/null || true
 }
 
 # Upstream Linux DTS aliases: mmc0 = &sdhci (eMMC), mmc1 = &sdmmc (SD),

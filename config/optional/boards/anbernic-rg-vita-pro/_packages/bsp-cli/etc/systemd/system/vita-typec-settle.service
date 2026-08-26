@@ -1,0 +1,14 @@
+[Unit]
+Description=Wait for USB-C Type-C/DP altmode before display manager
+DefaultDependencies=no
+After=systemd-udev-settle.service
+Before=display-manager.service lightdm.service gdm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/vita-typec-settle
+RemainAfterExit=yes
+TimeoutStartSec=35
+
+[Install]
+WantedBy=display-manager.service

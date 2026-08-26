@@ -1,0 +1,20 @@
+# USB-C MST dock display layout (Wayland / gdctl).
+#
+# MODE:
+#   auto          — 2 DP + panel (dual), or 3 DP (triple), or HDMI+2 DP (combo)
+#   dual          — built-in panel + two external DP monitors
+#   triple        — three external DP only (built-in display off in layout)
+#   hdmi-combo    — HDMI + two external DP (built-in display off)
+#   external-only — alias for triple
+#
+# REQUIRE_DOCK: skip if no Type-C partner (hot-unplugged dock)
+REQUIRE_DOCK=1
+
+MODE=auto
+
+# Resolution hints for dual mode (panel + 2 externals on 2-lane HBR2 dock)
+DUAL_EXT1_MODE=1680x1050@59.954
+DUAL_EXT2_MODE=1920x1080@60.000
+
+# Triple / combo external modes (1080p fits 2-lane MST bandwidth)
+TRIPLE_EXT_MODE=1920x1080@60.000

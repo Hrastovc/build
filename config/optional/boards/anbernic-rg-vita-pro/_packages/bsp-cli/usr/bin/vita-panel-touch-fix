@@ -1,0 +1,30 @@
+#!/bin/sh
+# Load touch only after the DSI panel has modeset, then soft-reinit the panel.
+# Touch shares vdd_lcd; early RMI4 probe causes horizontal blue lines.
+# vdd_lcd must be regulator-always-on so blanking does not kill touch.
+FB=/sys/class/graphics/fb0/blank
+
+for i in $(seq 1 60); do
+	[ -w "$FB" ] && break
+	sleep 1
+done
+[ -w "$FB" ] || exit 0
+
+# First modeset / console paint
+sleep 2
+
+if ! grep -q Synaptics /proc/bus/input/devices 2>/dev/null; then
+	# blacklisted for early autoload; insmod bypasses blacklist
+	modprobe rmi_core 2>/dev/null || true
+	KO=$(modinfo -n rmi_i2c 2>/dev/null)
+	if [ -n "$KO" ] && [ -f "$KO" ]; then
+		insmod "$KO" 2>/dev/null || modprobe rmi_i2c 2>/dev/null || true
+	else
+		modprobe rmi_i2c 2>/dev/null || true
+	fi
+	sleep 1
+fi
+
+echo 1 > "$FB" 2>/dev/null || exit 0
+sleep 1
+echo 0 > "$FB" 2>/dev/null || exit 0

@@ -960,8 +960,8 @@ state.rockchipes8388c {
 	control.41 {
 		iface MIXER
 		name 'PCM Volume'
-		value.0 192
-		value.1 192
+		value.0 128
+		value.1 128
 		comment {
 			access 'read write'
 			type INTEGER
@@ -1177,6 +1177,26 @@ state.rockchipes8388c {
 		iface MIXER
 		name 'Right Mixer Right Bypass Switch'
 		value false
+		comment {
+			access 'read write'
+			type BOOLEAN
+			count 1
+		}
+	}
+	control.59 {
+		iface MIXER
+		name 'Left Mixer Playback Switch'
+		value true
+		comment {
+			access 'read write'
+			type BOOLEAN
+			count 1
+		}
+	}
+	control.60 {
+		iface MIXER
+		name 'Right Mixer Playback Switch'
+		value true
 		comment {
 			access 'read write'
 			type BOOLEAN

@@ -1,0 +1,194 @@
+#!/bin/bash
+# Apply USB-C MST (and optional HDMI) display layouts after login.
+# GNOME may restore monitors.xml with externals disabled; boot can race MST.
+set -euo pipefail
+
+[ "${XDG_SESSION_TYPE:-}" = "wayland" ] || exit 0
+command -v gdctl >/dev/null 2>&1 || exit 0
+[ -n "${XDG_RUNTIME_DIR:-}" ] || exit 0
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+[ -r /etc/default/vita-dock-displays ] && . /etc/default/vita-dock-displays
+[ -r "${HOME}/.config/vita-dock-displays.conf" ] && . "${HOME}/.config/vita-dock-displays.conf"
+# Command-line / environment overrides (after defaults file).
+MODE="${VITA_DOCK_MODE:-${MODE:-auto}}"
+REQUIRE_DOCK="${VITA_DOCK_REQUIRE_DOCK:-${REQUIRE_DOCK:-1}}"
+DUAL_EXT1_MODE="${VITA_DOCK_DUAL_EXT1:-${DUAL_EXT1_MODE:-1680x1050@59.954}}"
+DUAL_EXT2_MODE="${VITA_DOCK_DUAL_EXT2:-${DUAL_EXT2_MODE:-1920x1080@60.000}}"
+TRIPLE_EXT_MODE="${VITA_DOCK_TRIPLE_EXT:-${TRIPLE_EXT_MODE:-1920x1080@60.000}}"
+PANEL_MODE="${VITA_DOCK_PANEL_MODE:-${PANEL_MODE:-1920x1080@60.030}}"
+PANEL_SCALE="${VITA_DOCK_PANEL_SCALE:-${PANEL_SCALE:-2.0}}"
+[ "${DISABLE:-0}" = "1" ] && exit 0
+
+LOG=/tmp/vita-dock-displays.log
+exec >"$LOG" 2>&1
+echo "vita-dock-displays start $(date -Is) MODE=$MODE"
+
+if [ "$REQUIRE_DOCK" = "1" ] && [ ! -e /sys/class/typec/port0/port0-partner ]; then
+	echo "no Type-C partner; exit"
+	exit 0
+fi
+
+drm_enabled() {
+	local conn="$1" p
+	for p in /sys/class/drm/card*-"${conn}"/enabled; do
+		[ -f "$p" ] || continue
+		[ "$(cat "$p")" = enabled ] && return 0
+	done
+	return 1
+}
+
+all_dp_enabled() {
+	local c
+	for c in "$@"; do
+		drm_enabled "$c" || return 1
+	done
+	return 0
+}
+
+apply_gdctl() {
+	echo "gdctl: $*"
+	set +e
+	gdctl set -P "$@"
+	local rc=$?
+	echo "gdctl rc=$rc"
+	set -e
+	return "$rc"
+}
+
+retry_apply() {
+	# $1..$n = connector names to verify; last arg is skipped — use global APPLY_ARGS
+	local -a conns=()
+	local c
+	for c in "$@"; do
+		conns+=("$c")
+	done
+	apply_gdctl "${APPLY_ARGS[@]}"
+	sleep 2
+	if all_dp_enabled "${conns[@]}"; then
+		return 0
+	fi
+	echo "retry modeset"
+	sleep 2
+	apply_gdctl "${APPLY_ARGS[@]}" || true
+	sleep 2
+	all_dp_enabled "${conns[@]}"
+}
+
+wait_drm() {
+	local deadline=$((SECONDS + 120))
+	while (( SECONDS < deadline )); do
+		gdctl show >/dev/null 2>&1 && return 0
+		sleep 2
+	done
+	return 1
+}
+
+wait_drm || { echo "gdctl not ready"; exit 0; }
+sleep 3
+
+readarray -t INFO < <(python3 - <<'PY'
+import glob, os, sys, time
+
+def drm_connected():
+    dp = []
+    for path in sorted(glob.glob("/sys/class/drm/card*-DP-*")):
+        name = os.path.basename(path)
+        # gdctl/Mutter use "DP-N", not "card0-DP-N".
+        if name.startswith("card") and "-DP-" in name:
+            name = name.split("-", 1)[1]
+        if open(os.path.join(path, "status")).read().strip() == "connected":
+            dp.append(name)
+    hdmi_on = any(
+        open(os.path.join(p, "status")).read().strip() == "connected"
+        for p in glob.glob("/sys/class/drm/card*-HDMI-A-*")
+    )
+    return dp, hdmi_on
+
+deadline = time.time() + 90
+while time.time() < deadline:
+    dp, hdmi = drm_connected()
+    if len(dp) >= 2 or (hdmi and len(dp) >= 1):
+        print(len(dp))
+        print("yes" if hdmi else "no")
+        for c in dp:
+            print(c)
+        sys.exit(0)
+    time.sleep(2)
+print(0)
+print("no")
+PY
+)
+
+dp_count="${INFO[0]:-0}"
+hdmi_on="${INFO[1]:-no}"
+mapfile -t DP_CONNS < <(printf '%s\n' "${INFO[@]:2}")
+
+echo "dp_count=$dp_count hdmi=$hdmi_on conns=${DP_CONNS[*]}"
+
+if [ "$dp_count" -lt 1 ] && [ "$hdmi_on" != "yes" ]; then
+	echo "nothing to configure"
+	exit 0
+fi
+
+case "$MODE" in
+external-only) MODE=triple ;;
+esac
+
+if [ "$MODE" = "auto" ]; then
+	if [ "$hdmi_on" = "yes" ] && [ "$dp_count" -ge 2 ]; then
+		MODE=hdmi-combo
+	elif [ "$dp_count" -ge 3 ]; then
+		MODE=triple
+	elif [ "$dp_count" -ge 2 ]; then
+		MODE=dual
+	else
+		echo "auto: only one DP; leave GNOME layout"
+		exit 0
+	fi
+	echo "auto picked MODE=$MODE"
+fi
+
+case "$MODE" in
+dual)
+	[ "$dp_count" -ge 2 ] || { echo "dual needs 2 DP"; exit 0; }
+	ext1="${DP_CONNS[0]}"
+	ext2="${DP_CONNS[1]}"
+	APPLY_ARGS=(
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE"
+		-L -M "$ext1" --mode "$DUAL_EXT1_MODE" --scale 1.0 --right-of DSI-1
+		-L -M "$ext2" --mode "$DUAL_EXT2_MODE" --scale 1.0 --right-of "$ext1"
+	)
+	retry_apply "$ext1" "$ext2"
+	;;
+triple)
+	[ "$dp_count" -ge 3 ] || { echo "triple needs 3 DP (have $dp_count)"; exit 0; }
+	ext1="${DP_CONNS[0]}"
+	ext2="${DP_CONNS[1]}"
+	ext3="${DP_CONNS[2]}"
+	APPLY_ARGS=(
+		-L -M "$ext1" --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0
+		-L -M "$ext2" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext1"
+		-L -M "$ext3" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext2"
+	)
+	retry_apply "$ext1" "$ext2" "$ext3"
+	;;
+hdmi-combo)
+	[ "$hdmi_on" = "yes" ] || { echo "hdmi-combo needs HDMI"; exit 0; }
+	[ "$dp_count" -ge 2 ] || { echo "hdmi-combo needs 2 DP"; exit 0; }
+	ext1="${DP_CONNS[0]}"
+	ext2="${DP_CONNS[1]}"
+	APPLY_ARGS=(
+		-L -M HDMI-A-1 --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0
+		-L -M "$ext1" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of HDMI-A-1
+		-L -M "$ext2" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext1"
+	)
+	retry_apply "$ext1" "$ext2"
+	;;
+*)
+	echo "unknown MODE=$MODE"
+	exit 1
+	;;
+esac
+
+echo "done"
