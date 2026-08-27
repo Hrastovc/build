@@ -1017,10 +1017,11 @@
 &usbdp_phy_dp {
 	status = "okay";
 	/*
-	 * Cap at HBR2 for Type-C. HBR3+MST (2-lane dock) overflows dw-dp
-	 * video FIFOs and yields black screens; SST USB-C→DP at HBR2 is fine.
+	 * Allow HBR3 (8.1 Gbps). Previously capped at HBR2 (5400) because
+	 * HBR3+MST on a 2-lane dock overflowed dw-dp FIFOs; re-test with
+	 * current MST/VP wiring before reverting.
 	 */
-	max-link-rate = <5400>;
+	max-link-rate = <8100>;
 };
 
 &usbdp_phy_u3 {
@@ -1071,7 +1072,7 @@
  * DPMST encoder so Mutter can assign CRTCs. Disjoint per-stream VP wiring
  * breaks dual MST ("No available CRTC"). Panel uses VP1; dp2 also wires
  * VP1 for triple-external (panel off). HDMI shares VP0 — see userspace
- * vita-dock-displays MODE=hdmi-combo. HBR2 cap avoids MST FIFO overflow.
+ * vita-dock-displays MODE=hdmi-combo. HBR3 (8100) preferred for 1440p MST.
  */
 &dp0_in_vp0 {
 	status = "okay";

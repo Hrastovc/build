@@ -4,7 +4,7 @@
 #   auto          — 2 DP + panel (dual), or 3 DP (triple), or HDMI+2 DP (combo)
 #   dual          — built-in panel + two external DP monitors
 #   triple        — three external DP only (built-in display off in layout)
-#   hdmi-combo    — HDMI + two external DP (built-in display off)
+#   hdmi-combo    — SoC HDMI + two external DP (built-in display off)
 #   external-only — alias for triple
 #
 # REQUIRE_DOCK: skip if no Type-C partner (hot-unplugged dock)
@@ -12,9 +12,11 @@ REQUIRE_DOCK=1
 
 MODE=auto
 
-# Resolution hints for dual mode (panel + 2 externals on 2-lane HBR2 dock)
-DUAL_EXT1_MODE=1680x1050@59.954
-DUAL_EXT2_MODE=1920x1080@60.000
+# Dual MST: highest-EDID monitor modeset first (claims VP0 for 1440p).
+# Second monitor on VP2: 1680x1050 modesets but often rainbows when paired
+# with 1440p (2-lane MST bandwidth/FIFO). Prefer 1280x1024@60 (matched CRTC).
+DUAL_HI_MODE=2560x1440@59.951
+DUAL_LO_MODE=1280x1024@60.020
 
-# Triple / combo external modes (1080p fits 2-lane MST bandwidth)
+# Triple / combo external modes
 TRIPLE_EXT_MODE=1920x1080@60.000

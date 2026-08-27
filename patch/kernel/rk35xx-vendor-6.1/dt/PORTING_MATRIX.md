@@ -156,7 +156,7 @@ Individual edge regulator labels (`vdd_cpu_*`, `vccio_sd_s0`, `vcca_3v3_s0`, …
 | `&vp0` HDMI endpoint | present | **done** | `&hdmi_in_vp0` + `&route_hdmi` → `vp0_out_hdmi` |
 | `&vp2` DP0 endpoint | present | **done** | `&dp0_in_vp{0,2}` + `&route_dp0` → `vp2_out_dp0` |
 | USB-C MST `&dp0` / `&dp1` / `&dp2` | present | **done** | Three dw-dp stream encoders; `dp0`+`dp1`+`dp2` okay; overlapping VP endpoints for GNOME |
-| `max-link-rate = <5400>` (HBR2) | present | **done** | Avoids MST FIFO overflow on 2-lane dock; SST 4-lane 1440p still OK |
+| `max-link-rate = <8100>` (HBR3) | present | **done** | HBR3 enables dual MST 1680×1050+1440p; was 5400 when FIFO overflowed |
 | `display_subsystem` HDMI PHY PLL | present | **done** | Exact DP pixel clocks (e.g. 2560×1440 @ 241.5 MHz) |
 | `&hdmi` / `&hdmi_in` / `&hdmi_out` / `hdmi_con` | `&hdmi` + `&hdmi_in_vp0` | **done** | BSP style (no `hdmi_out` / connector node) |
 | `&hdmi_sound` / `&hdptxphy` / `&dp` | present | **done** | `hdmi_sound` + `&hdptxphy_hdmi` + `&dp`/`&dp0`/`&dp1`/`&dp2` |
@@ -285,7 +285,7 @@ Three VOP CRTCs (VP0, VP1, VP2). Only **three** simultaneous scanouts.
 
 | Mode | Outputs | Notes |
 |------|---------|--------|
-| **dual** (default) | Panel + 2× USB-C DP | 2-lane HBR2 dock; ~1680×1050 + 1080p |
+| **dual** (default) | Panel + 2× USB-C DP | 2-lane HBR3 dock; ~1680×1050 + 1440p |
 | **triple** | 3× USB-C DP | Panel off in layout; needs 3-port MST hub; stream2 (`dp2`) ≤1080p |
 | **hdmi-combo** | HDMI + 2× USB-C DP | Panel off; HDMI uses VP0 (conflicts with MST stream on VP0 if panel on) |
 | **SST cable** | 1× USB-C DP @ 4-lane | Direct cable; up to 1440p @ HBR2 |

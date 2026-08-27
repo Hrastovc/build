@@ -1,6 +1,10 @@
 #!/bin/bash
 # Apply USB-C MST (and optional HDMI) display layouts after login.
 # GNOME may restore monitors.xml with externals disabled; boot can race MST.
+#
+# Dual MST note: only VP0 can modeset 1440p (241.5 MHz). VP2 sticks at ~1080p
+# while Mutter may still allocate a 1440p FB → cropped/magnified desktop.
+# Claim VP0 with the highest-resolution monitor first, then add the second.
 set -euo pipefail
 
 [ "${XDG_SESSION_TYPE:-}" = "wayland" ] || exit 0
@@ -13,8 +17,8 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUN
 # Command-line / environment overrides (after defaults file).
 MODE="${VITA_DOCK_MODE:-${MODE:-auto}}"
 REQUIRE_DOCK="${VITA_DOCK_REQUIRE_DOCK:-${REQUIRE_DOCK:-1}}"
-DUAL_EXT1_MODE="${VITA_DOCK_DUAL_EXT1:-${DUAL_EXT1_MODE:-1680x1050@59.954}}"
-DUAL_EXT2_MODE="${VITA_DOCK_DUAL_EXT2:-${DUAL_EXT2_MODE:-1920x1080@60.000}}"
+DUAL_HI_MODE="${VITA_DOCK_DUAL_HI:-${DUAL_HI_MODE:-${DUAL_EXT2_MODE:-2560x1440@59.951}}}"
+DUAL_LO_MODE="${VITA_DOCK_DUAL_LO:-${DUAL_LO_MODE:-${DUAL_EXT1_MODE:-1680x1050@59.954}}}"
 TRIPLE_EXT_MODE="${VITA_DOCK_TRIPLE_EXT:-${TRIPLE_EXT_MODE:-1920x1080@60.000}}"
 PANEL_MODE="${VITA_DOCK_PANEL_MODE:-${PANEL_MODE:-1920x1080@60.030}}"
 PANEL_SCALE="${VITA_DOCK_PANEL_SCALE:-${PANEL_SCALE:-2.0}}"
@@ -56,25 +60,6 @@ apply_gdctl() {
 	return "$rc"
 }
 
-retry_apply() {
-	# $1..$n = connector names to verify; last arg is skipped — use global APPLY_ARGS
-	local -a conns=()
-	local c
-	for c in "$@"; do
-		conns+=("$c")
-	done
-	apply_gdctl "${APPLY_ARGS[@]}"
-	sleep 2
-	if all_dp_enabled "${conns[@]}"; then
-		return 0
-	fi
-	echo "retry modeset"
-	sleep 2
-	apply_gdctl "${APPLY_ARGS[@]}" || true
-	sleep 2
-	all_dp_enabled "${conns[@]}"
-}
-
 wait_drm() {
 	local deadline=$((SECONDS + 120))
 	while (( SECONDS < deadline )); do
@@ -90,20 +75,43 @@ sleep 3
 readarray -t INFO < <(python3 - <<'PY'
 import glob, os, sys, time
 
+def conn_name(path):
+    name = os.path.basename(path)
+    if name.startswith("card") and "-DP-" in name:
+        return name.split("-", 1)[1]
+    if name.startswith("card") and "-HDMI-" in name:
+        return name.split("-", 1)[1]
+    return name
+
+def max_mode_pixels(path):
+    modes = os.path.join(path, "modes")
+    best = 0
+    try:
+        for line in open(modes):
+            line = line.strip()
+            if "x" not in line:
+                continue
+            wh = line.split("@")[0] if "@" in line else line
+            w, h = wh.split("x")[:2]
+            best = max(best, int(w) * int(h))
+    except OSError:
+        pass
+    return best
+
 def drm_connected():
     dp = []
     for path in sorted(glob.glob("/sys/class/drm/card*-DP-*")):
-        name = os.path.basename(path)
-        # gdctl/Mutter use "DP-N", not "card0-DP-N".
-        if name.startswith("card") and "-DP-" in name:
-            name = name.split("-", 1)[1]
-        if open(os.path.join(path, "status")).read().strip() == "connected":
-            dp.append(name)
+        if open(os.path.join(path, "status")).read().strip() != "connected":
+            continue
+        name = conn_name(path)
+        dp.append((max_mode_pixels(path), name))
+    # Highest native resolution first → claims VP0 for 1440p.
+    dp.sort(reverse=True)
     hdmi_on = any(
         open(os.path.join(p, "status")).read().strip() == "connected"
         for p in glob.glob("/sys/class/drm/card*-HDMI-A-*")
     )
-    return dp, hdmi_on
+    return [n for _, n in dp], hdmi_on
 
 deadline = time.time() + 90
 while time.time() < deadline:
@@ -152,38 +160,54 @@ fi
 case "$MODE" in
 dual)
 	[ "$dp_count" -ge 2 ] || { echo "dual needs 2 DP"; exit 0; }
-	ext1="${DP_CONNS[0]}"
-	ext2="${DP_CONNS[1]}"
+	hi="${DP_CONNS[0]}"
+	lo="${DP_CONNS[1]}"
+	echo "hi=$hi ($DUAL_HI_MODE) lo=$lo ($DUAL_LO_MODE)"
+
+	# Phase 1: panel only — free VP0/VP2.
+	apply_gdctl \
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE" || true
+	sleep 2
+
+	# Phase 2: high-res external alone → Mutter assigns VP0 (can do 1440p).
+	apply_gdctl \
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE" \
+		-L -M "$hi" --mode "$DUAL_HI_MODE" --scale 1.0 --right-of DSI-1 || true
+	sleep 2
+
+	# Phase 3: add second external on remaining VP (VP2, ~1080p-class OK).
 	APPLY_ARGS=(
 		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE"
-		-L -M "$ext1" --mode "$DUAL_EXT1_MODE" --scale 1.0 --right-of DSI-1
-		-L -M "$ext2" --mode "$DUAL_EXT2_MODE" --scale 1.0 --right-of "$ext1"
+		-L -M "$hi" --mode "$DUAL_HI_MODE" --scale 1.0 --right-of DSI-1
+		-L -M "$lo" --mode "$DUAL_LO_MODE" --scale 1.0 --right-of "$hi"
 	)
-	retry_apply "$ext1" "$ext2"
+	apply_gdctl "${APPLY_ARGS[@]}" || true
+	sleep 2
+	if ! all_dp_enabled "$hi" "$lo"; then
+		echo "retry phase 3"
+		sleep 2
+		apply_gdctl "${APPLY_ARGS[@]}" || true
+	fi
 	;;
 triple)
 	[ "$dp_count" -ge 3 ] || { echo "triple needs 3 DP (have $dp_count)"; exit 0; }
 	ext1="${DP_CONNS[0]}"
 	ext2="${DP_CONNS[1]}"
 	ext3="${DP_CONNS[2]}"
-	APPLY_ARGS=(
-		-L -M "$ext1" --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0
-		-L -M "$ext2" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext1"
-		-L -M "$ext3" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext2"
-	)
-	retry_apply "$ext1" "$ext2" "$ext3"
+	apply_gdctl \
+		-L -M "$ext1" --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0 \
+		-L -M "$ext2" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext1" \
+		-L -M "$ext3" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext2" || true
 	;;
 hdmi-combo)
 	[ "$hdmi_on" = "yes" ] || { echo "hdmi-combo needs HDMI"; exit 0; }
 	[ "$dp_count" -ge 2 ] || { echo "hdmi-combo needs 2 DP"; exit 0; }
 	ext1="${DP_CONNS[0]}"
 	ext2="${DP_CONNS[1]}"
-	APPLY_ARGS=(
-		-L -M HDMI-A-1 --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0
-		-L -M "$ext1" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of HDMI-A-1
-		-L -M "$ext2" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext1"
-	)
-	retry_apply "$ext1" "$ext2"
+	apply_gdctl \
+		-L -M HDMI-A-1 --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0 \
+		-L -M "$ext1" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of HDMI-A-1 \
+		-L -M "$ext2" --mode "$TRIPLE_EXT_MODE" --scale 1.0 --right-of "$ext1" || true
 	;;
 *)
 	echo "unknown MODE=$MODE"
