@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hrastovc <hrastovc@gmail.com>
+Date: Wed, 18 Nov 2026 18:00:00 +0100
+Subject: drm/rockchip: poll AUX replies and preserve active MST state
+
+---
+ drivers/gpu/drm/rockchip/dw-dp.c | 90 ++++++----
+ 1 file changed, 60 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/dw-dp.c b/drivers/gpu/drm/rockchip/dw-dp.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/rockchip/dw-dp.c
++++ b/drivers/gpu/drm/rockchip/dw-dp.c
+@@ -62,6 +62,7 @@
+ #define DPTX_CCTL				0x0200
+ #define DPTX_CCTL_INITIATE_MST_ACT		BIT(28)
+ #define ENABLE_MST_MODE				BIT(25)
++#define AUX_REPLY_TIMEOUT_3_2MS			BIT(6)
+ #define FORCE_HPD				BIT(4)
+ #define DEFAULT_FAST_LINK_TRAIN_EN		BIT(2)
+ #define ENHANCE_FRAMING_EN			BIT(1)
+@@ -163,6 +164,7 @@
+ #define AUX_LEN_REQ				GENMASK(3, 0)
+ #define DPTX_AUX_STATUS				0x0b04
+ #define AUX_TIMEOUT				BIT(17)
++#define AUX_REPLY_ERR				BIT(18)
+ #define AUX_BYTES_READ				GENMASK(23, 19)
+ #define AUX_STATUS				GENMASK(7, 4)
+ #define DPTX_AUX_DATA0				0x0b08
+@@ -3248,9 +3250,9 @@ static void dw_dp_hpd_init(struct dw_dp *dp)
+ 
+ static void dw_dp_aux_init(struct dw_dp *dp)
+ {
++	regmap_update_bits(dp->regmap, DPTX_CCTL, AUX_REPLY_TIMEOUT_3_2MS, 0);
+ 	regmap_update_bits(dp->regmap, DPTX_GENERAL_INTERRUPT_ENABLE,
+-			   AUX_REPLY_EVENT_EN,
+-			   FIELD_PREP(AUX_REPLY_EVENT_EN, 1));
++			   AUX_REPLY_EVENT_EN, 0);
+ }
+ 
+ static void dw_dp_init(struct dw_dp *dp)
+@@ -3492,6 +3494,11 @@ static int dw_dp_aux_read_data(struct dw_dp *dp, u8 *buffer, size_t size)
+ 
+ static void dw_dp_aux_reset(struct dw_dp *dp)
+ {
++	if (READ_ONCE(dp->mst_mgr.mst_primary)) {
++		dev_dbg(dp->dev, "MST active: skip AUX reset\n");
++		return;
++	}
++
+ 	regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL, AUX_RESET,
+ 			   FIELD_PREP(AUX_RESET, 1));
+ 	udelay(10);
+@@ -3503,8 +3510,7 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
+ 				  struct drm_dp_aux_msg *msg)
+ {
+ 	struct dw_dp *dp = container_of(aux, struct dw_dp, aux);
+-	unsigned long timeout = msecs_to_jiffies(10);
+-	u32 status, value;
++	u32 status, value, aux_status;
+ 	ssize_t ret = 0;
+ 	int retry;
+ 
+@@ -3536,56 +3542,86 @@ static ssize_t dw_dp_aux_transfer(struct drm_dp_aux *aux,
+ 		value = FIELD_PREP(I2C_ADDR_ONLY, 1);
+ 	value |= FIELD_PREP(AUX_CMD_TYPE, msg->request);
+ 	value |= FIELD_PREP(AUX_ADDR, msg->address);
+-	for (retry = 0; retry < 2; retry++) {
+-		reinit_completion(&dp->complete);
++	for (retry = 0; retry < 3; retry++) {
++		regmap_write(dp->regmap, DPTX_GENERAL_INTERRUPT, AUX_REPLY_EVENT);
+ 		regmap_write(dp->regmap, DPTX_AUX_CMD, value);
+ 
+-		status = wait_for_completion_timeout(&dp->complete, timeout);
++		status = !regmap_read_poll_timeout(dp->regmap, DPTX_GENERAL_INTERRUPT,
++						  aux_status, aux_status & AUX_REPLY_EVENT,
++						  50, 20000);
++		if (status)
++			regmap_read(dp->regmap, DPTX_AUX_STATUS, &aux_status);
++		regmap_write(dp->regmap, DPTX_GENERAL_INTERRUPT, AUX_REPLY_EVENT);
+ 		if (status)
+ 			break;
+ 
+-		/* AUX timeout: reset AUX module and retry. On USB-C
+-		 * DP Alt Mode setups the AUX channel gets stuck after
+-		 * prolonged main link transmission. Reinitializing the
+-		 * completion and resetting the AUX module restores
+-		 * native AUX functionality for link training.
++		/*
++		 * Preserve AUX state while the MST topology is active.
++		 * Appear_busy used to block reset too; VIA then died on the first
++		 * DPCD read in set_mst (cmd=0x9 addr=0) with empty topo. Allow
++		 * one timeout reset during appear so LINK_ADDRESS can retry.
+ 		 */
+-		if (retry == 0) {
+-			dev_warn_ratelimited(dp->dev, "AUX timeout, resetting (cmd=0x%x addr=0x%x)\n",
+-					     msg->request, msg->address);
+-			regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL,
+-					   AUX_RESET, AUX_RESET);
+-			usleep_range(10, 20);
+-			regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL,
+-					   AUX_RESET, 0);
+-			usleep_range(100, 200);
++		if (retry == 0 && !READ_ONCE(dp->mst_mgr.mst_primary)) {
++			dev_warn_ratelimited(dp->dev,
++					     "AUX timeout, resetting (cmd=0x%x addr=0x%x is_mst=%d)\n",
++					     msg->request, msg->address, dp->is_mst);
++			dw_dp_aux_reset(dp);
++			usleep_range(50, 100);
+ 			dw_dp_aux_init(dp);
++		} else {
++			dev_warn_ratelimited(dp->dev,
++					     "AUX timeout (cmd=0x%x addr=0x%x is_mst=%d try=%d)\n",
++					     msg->request, msg->address, dp->is_mst, retry);
++			usleep_range(50, 100);
+ 		}
+ 	}
+ 
+ 	if (!status) {
+ 		regmap_read(dp->regmap, DPTX_AUX_STATUS, &value);
+-		dev_dbg(dp->dev, "AUX timeout after recovery: cmd=0x%x addr=0x%x size=%d, AUX_STATUS=0x%x\n",
++		dev_dbg(dp->dev, "AUX timeout after recovery: cmd=0x%x addr=0x%x size=%zu, AUX_STATUS=0x%x\n",
+ 			msg->request, msg->address, msg->size, value);
+ 		dw_dp_aux_reset(dp);
+ 		ret = -ETIMEDOUT;
+ 		goto out;
+ 	}
+ 
+-	regmap_read(dp->regmap, DPTX_AUX_STATUS, &value);
++	value = aux_status;
++	if ((msg->request == DP_AUX_NATIVE_WRITE &&
++	     msg->address == DP_SIDEBAND_MSG_DOWN_REQ_BASE) ||
++	    (value & (AUX_TIMEOUT | AUX_REPLY_ERR)))
++		dev_dbg(dp->dev,
++			"AUX result: cmd=%x addr=%x size=%zu status=%08x\n",
++			msg->request, msg->address, msg->size, value);
++
+ 	if (value & AUX_TIMEOUT) {
+ 		dw_dp_aux_reset(dp);
+ 		ret = -ETIMEDOUT;
+ 		goto out;
+ 	}
+-
+ 	msg->reply = FIELD_GET(AUX_STATUS, value);
++	if (msg->request == DP_AUX_NATIVE_READ ||
++	    msg->request == DP_AUX_NATIVE_WRITE) {
++		if ((msg->reply & DP_AUX_I2C_REPLY_MASK) ||
++		    (msg->request == DP_AUX_NATIVE_WRITE &&
++		     msg->reply == DP_AUX_NATIVE_REPLY_ACK &&
++		     FIELD_GET(AUX_BYTES_READ, value) != 1)) {
++			dev_dbg(dp->dev,
++				"Invalid native AUX reply: cmd=%x addr=%x status=%08x\n",
++				msg->request, msg->address, value);
++			ret = -EPROTO;
++			goto out;
++		}
++	}
+ 
+ 	if (msg->size > 0 && msg->reply == DP_AUX_NATIVE_REPLY_ACK) {
+ 		if (msg->request & DP_AUX_I2C_READ) {
+ 			size_t count = FIELD_GET(AUX_BYTES_READ, value) - 1;
+ 
+ 			if (count != msg->size) {
++				dev_dbg(dp->dev,
++					"AUX count mismatch: cmd=%x addr=%x want=%zu got=%zu status=%08x\n",
++					msg->request, msg->address, msg->size,
++					count, value);
+ 				ret = -EBUSY;
+ 				goto out;
+ 			}
+@@ -5683,12 +5719,6 @@ static irqreturn_t dw_dp_irq_handler(int irq, void *data)
+ 	if (value & HPD_EVENT)
+ 		dw_dp_handle_hpd_event(dp);
+ 
+-	if (value & AUX_REPLY_EVENT) {
+-		regmap_write(dp->regmap, DPTX_GENERAL_INTERRUPT,
+-			     AUX_REPLY_EVENT);
+-		complete(&dp->complete);
+-	}
+-
+ 	if (value & HDCP_EVENT)
+ 		dw_dp_handle_hdcp_event(dp);
+ 
+-- 
+Armbian
+
