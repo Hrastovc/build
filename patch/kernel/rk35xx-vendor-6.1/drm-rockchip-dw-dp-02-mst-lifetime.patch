@@ -1,0 +1,586 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hrastovc <hrastovc@gmail.com>
+Date: Wed, 18 Nov 2026 18:00:00 +0100
+Subject: drm/rockchip: retain power and poll MST sideband replies
+
+---
+ drivers/gpu/drm/rockchip/dw-dp.c | 393 +++++++++-
+ 1 file changed, 354 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/dw-dp.c b/drivers/gpu/drm/rockchip/dw-dp.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/rockchip/dw-dp.c
++++ b/drivers/gpu/drm/rockchip/dw-dp.c
+@@ -24,6 +24,7 @@
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_simple_kms_helper.h>
+ 
++#include <linux/atomic.h>
+ #include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/component.h>
+@@ -466,12 +467,18 @@ struct dw_dp {
+ 	struct clk *hclk;
+ 	struct clk *hdcp_clk;
+ 	struct reset_control *rstc;
+-	struct completion complete;
+ 	struct completion hdcp_complete;
+ 	int irq;
+ 	int hpd_irq;
+ 	int id;
+ 	struct work_struct hpd_work;
++	struct work_struct mst_appear_work;
++	struct mutex mst_irq_lock;
++	atomic_t mst_appear_busy;
++	bool mst_powered;
++	bool mst_disconnecting;
++	bool mst_esi_muted;
++	unsigned int mst_esi_fail_streak;
+ 	struct gpio_desc *hpd_gpio;
+ 	bool force_hpd;
+ 	bool usbdp_hpd;
+@@ -2358,8 +2365,11 @@ static int dw_dp_link_clock_recovery(struct dw_dp *dp)
+ 
+ 		ret = drm_dp_dpcd_read_link_status(&dp->aux, status);
+ 		if (ret < 0) {
+-			dev_err(dp->dev, "failed to read link status: %d\n", ret);
+-			return ret;
++			dev_warn(dp->dev,
++				 "failed to read link status during CR: %d (will downgrade)\n",
++				 ret);
++			link->train.clock_recovered = false;
++			return 0;
+ 		}
+ 
+ 		if (drm_dp_clock_recovery_ok(status, link->lanes)) {
+@@ -3255,6 +3265,22 @@ static void dw_dp_aux_init(struct dw_dp *dp)
+ 			   AUX_REPLY_EVENT_EN, 0);
+ }
+ 
++/*
++ * USB-C AUX often sticks after prolonged main-link TX (link train).
++ * Deliberate reset after train / before sideband; do not reset mid wait_tx_reply.
++ */
++static void dw_dp_aux_unstick(struct dw_dp *dp, const char *why)
++{
++	dev_dbg(dp->dev, "MST AUX unstick after %s\n", why);
++	regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL,
++			   AUX_RESET, AUX_RESET);
++	usleep_range(20, 40);
++	regmap_update_bits(dp->regmap, DPTX_SOFT_RESET_CTRL,
++			   AUX_RESET, 0);
++	usleep_range(50, 100);
++	dw_dp_aux_init(dp);
++}
++
+ static void dw_dp_init(struct dw_dp *dp)
+ {
+ 	regmap_update_bits(dp->regmap, DPTX_CCTL, DEFAULT_FAST_LINK_TRAIN_EN,
+@@ -3938,7 +3964,7 @@ static void dw_dp_mst_assigned_encoder(struct dw_dp *dp, struct drm_atomic_state
+ 			encoder_mask |= drm_encoder_mask(connector->state->best_encoder);
+ 	}
+ 
+-	dev_info(dp->dev, "assgned encoder_mask:%x\n", encoder_mask);
++	dev_dbg(dp->dev, "assgned encoder_mask:%x\n", encoder_mask);
+ 
+ 	/* assigned encoder for attached connector */
+ 	list_for_each_entry(mst_conn, &dp->mst_conn_list, head) {
+@@ -4287,17 +4313,48 @@ static void dw_dp_mst_encoder_atomic_enable(struct drm_encoder *encoder,
+ 		if (ret < 0)
+ 			dev_err(dp->dev, "link power up failed: %d\n", ret);
+ 
+-		ret = dw_dp_link_train(dp);
+-		if (ret < 0)
+-			dev_err(dp->dev, "link training failed: %d\n", ret);
++		/*
++		 * Appear path already trains. A second full train can reset
++		 * VIA/Realtek MST branch state under an active topology.
++		 */
++		if (dw_dp_link_train_valid(&dp->link.train)) {
++			dev_dbg(dp->dev,
++				 "MST link already trained, skipping modeset train\n");
++		} else {
++			msleep(50);
++			ret = dw_dp_link_train(dp);
++			if (ret < 0)
++				dev_err(dp->dev, "link training failed: %d\n", ret);
++		}
+ 
+ 		dw_dp_mst_enable(dp);
+ 		dw_dp_clear_vcpid_table(dp);
++		msleep(50);
++		/* Preserve AUX state during active MST sideband requests. */
+ 	}
+ 
+-	ret = drm_dp_send_power_updown_phy(&dp->mst_mgr, mst_conn->port, true);
+-	if (ret < 0)
+-		dev_err(dp->dev, "send power updown phy failed:%d\n", ret);
++	msleep(150);
++	/* Poll ESI while sideband requests wait for replies. */
++	dp->mst_esi_muted = false;
++	dp->mst_esi_fail_streak = 0;
++	dev_dbg(dp->dev, "MST POWER_UP_PHY port=%d\n",
++		 mst_conn->port ? mst_conn->port->port_num : -1);
++
++	{
++		int sb_retry;
++
++		for (sb_retry = 0; sb_retry < 8; sb_retry++) {
++			ret = drm_dp_send_power_updown_phy(&dp->mst_mgr,
++							   mst_conn->port, true);
++			if (!ret)
++				break;
++			msleep(50);
++		}
++		if (ret < 0) {
++			dev_err(dp->dev, "send power updown phy failed:%d\n", ret);
++			return;
++		}
++	}
+ 
+ 	payload = drm_atomic_get_mst_payload_state(mst_state, mst_conn->port);
+ 	ret = drm_dp_add_payload_part1(&dp->mst_mgr, mst_state, payload);
+@@ -4315,12 +4372,29 @@ static void dw_dp_mst_encoder_atomic_enable(struct drm_encoder *encoder,
+ 	if (ret < 0)
+ 		dev_err(dp->dev, "failed to check act status:%d\n", ret);
+ 
++	{
++		int sb_retry;
++
++		for (sb_retry = 0; sb_retry < 8; sb_retry++) {
++			ret = drm_dp_add_payload_part2(&dp->mst_mgr, state, payload);
++			if (!ret)
++				break;
++			msleep(50);
++		}
++	}
++
++	if (ret) {
++		dev_err(dp->dev,
++			"MST payload part2 failed: %d (skipping video enable)\n",
++			ret);
++		return;
++	}
++
+ 	ret = dw_dp_video_enable(dp, &mst_enc->video, &mst_conn->connector, mst_enc->stream_id);
+ 	if (ret < 0)
+ 		dev_err(dp->dev, "failed to enable video: %d\n", ret);
+ 
+ 	dw_dp_enable_vop_gate(dp, encoder->crtc, mst_enc->stream_id, true);
+-	drm_dp_add_payload_part2(&dp->mst_mgr, state, payload);
+ 	extcon_set_state_sync(mst_enc->audio->extcon, EXTCON_DISP_DP, true);
+ 	dw_dp_audio_handle_plugged_change(mst_enc->audio, true);
+ }
+@@ -4400,8 +4474,13 @@ static void dw_dp_mst_encoder_atomic_disable(struct drm_encoder *encoder,
+ 	dw_dp_video_disable(dp, mst_enc->stream_id);
+ 	dw_dp_sdp_disable(dp, mst_enc->stream_id);
+ 	if (!dp->active_mst_links) {
+-		dw_dp_mst_disable(dp);
+-		dw_dp_link_disable(dp);
++		if (dp->is_mst && !dp->mst_disconnecting && dp->mst_powered) {
++			/* Keep the trained link for the connected MST topology. */
++			phy_power_off(dp->phy);
++		} else {
++			dw_dp_mst_disable(dp);
++			dw_dp_link_disable(dp);
++		}
+ 	}
+ 
+ 	extcon_set_state_sync(mst_enc->audio->extcon, EXTCON_DISP_DP, false);
+@@ -4586,8 +4665,55 @@ dw_dp_add_mst_connector(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_p
+ 	return NULL;
+ }
+ 
++static void dw_dp_mst_topology_poll_hpd_irq(struct drm_dp_mst_topology_mgr *mgr)
++{
++	struct dw_dp *dp = container_of(mgr, struct dw_dp, mst_mgr);
++	u8 esi[4] = {};
++	u8 ack[4] = {};
++	bool handled = false;
++	int ret;
++
++	/*
++	 * Do not gate on mst_appear_busy: appear work holds that flag across
++	 * set_mst()/LINK_ADDRESS, and poll_hpd_irq must run every ~50ms to
++	 * catch DOWN_REP (sink clears it after ~110ms).
++	 */
++	if (dp->mst_disconnecting || dp->mst_esi_muted)
++		return;
++
++	mutex_lock(&dp->mst_irq_lock);
++	ret = drm_dp_dpcd_read(&dp->aux, DP_SINK_COUNT_ESI, esi, 4);
++	if (ret != 4) {
++		dp->mst_esi_fail_streak++;
++		dev_dbg_ratelimited(dp->dev,
++			"MST POLL: ESI read failed ret=%d streak=%u\n",
++			ret, dp->mst_esi_fail_streak);
++		goto out;
++	}
++
++	dp->mst_esi_fail_streak = 0;
++
++	if (esi[1] & DP_DOWN_REP_MSG_RDY)
++		dev_dbg_ratelimited(dp->dev,
++				     "MST POLL: DOWN_REP ready in ESI\n");
++
++	drm_dp_mst_hpd_irq_handle_event(&dp->mst_mgr, esi, ack, &handled);
++	if (!memchr_inv(ack, 0, sizeof(ack)))
++		goto out;
++
++	if (drm_dp_dpcd_write(&dp->aux, DP_SINK_COUNT_ESI + 1, &ack[1], 3) < 0) {
++		dp->mst_esi_fail_streak++;
++		goto out;
++	}
++	if (ack[1] & (DP_DOWN_REP_MSG_RDY | DP_UP_REQ_MSG_RDY))
++		drm_dp_mst_hpd_irq_send_new_request(&dp->mst_mgr);
++out:
++	mutex_unlock(&dp->mst_irq_lock);
++}
++
+ static const struct drm_dp_mst_topology_cbs mst_cbs = {
+ 	.add_connector = dw_dp_add_mst_connector,
++	.poll_hpd_irq = dw_dp_mst_topology_poll_hpd_irq,
+ };
+ 
+ static bool
+@@ -5016,37 +5142,192 @@ static void dw_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+ 	dw_dp_audio_handle_plugged_change(dp->audio, false);
+ }
+ 
+-static bool dw_dp_detect_dpcd(struct dw_dp *dp)
++static int dw_dp_mst_power_get(struct dw_dp *dp)
+ {
+-	u8 value;
+ 	int ret;
+ 
++	if (dp->mst_powered)
++		return 0;
++
++	ret = pm_runtime_resume_and_get(dp->dev);
++	if (ret < 0)
++		return ret;
++
+ 	ret = phy_power_on(dp->phy);
++	if (ret) {
++		pm_runtime_mark_last_busy(dp->dev);
++		pm_runtime_put_autosuspend(dp->dev);
++		return ret;
++	}
++
++	dp->mst_powered = true;
++	return 0;
++}
++
++static void dw_dp_mst_power_put(struct dw_dp *dp)
++{
++	if (!dp->mst_powered)
++		return;
++
++	phy_power_off(dp->phy);
++	dp->mst_powered = false;
++	pm_runtime_mark_last_busy(dp->dev);
++	pm_runtime_put_autosuspend(dp->dev);
++}
++
++static bool dw_dp_detect_dpcd(struct dw_dp *dp)
++{
++	u8 value;
++	int ret, retry;
++
++	if (dp->is_mst || atomic_read(&dp->mst_appear_busy))
++		return true;
++
++	ret = dw_dp_mst_power_get(dp);
+ 	if (ret)
+ 		goto fail_power_on;
+ 
+-	ret = drm_dp_dpcd_readb(&dp->aux, DP_DPCD_REV, &value);
++	for (retry = 0; retry < 5; retry++) {
++		ret = drm_dp_dpcd_readb(&dp->aux, DP_DPCD_REV, &value);
++		if (ret >= 0)
++			break;
++		if (ret != -EBUSY && ret != -ETIMEDOUT && ret != -EIO)
++			break;
++		msleep(20);
++	}
+ 	if (ret < 0) {
+ 		dev_err(dp->dev, "aux failed to read dpcd: %d\n", ret);
+ 		goto fail_probe;
+ 	}
+ 
+-	ret = dw_dp_link_probe(dp);
++	for (retry = 0; retry < 5; retry++) {
++		ret = dw_dp_link_probe(dp);
++		if (!ret)
++			break;
++		if (ret != -EBUSY && ret != -ETIMEDOUT && ret != -EIO)
++			break;
++		msleep(20);
++	}
+ 	if (ret) {
+ 		dev_err(dp->dev, "failed to probe DP link: %d\n", ret);
+ 		goto fail_probe;
+ 	}
+ 
+-	phy_power_off(dp->phy);
++	if (dp->link.sink_support_mst)
++		return true;
++
++	dw_dp_mst_power_put(dp);
+ 
+ 	return true;
+ 
+ fail_probe:
+-	phy_power_off(dp->phy);
++	dw_dp_mst_power_put(dp);
+ fail_power_on:
+ 	return false;
+ }
+ 
++static void dw_dp_mst_teardown(struct dw_dp *dp, const char *why)
++{
++	dev_dbg(dp->dev, "MST teardown (%s)\n", why);
++	dp->mst_disconnecting = true;
++	dp->mst_esi_muted = true; /* stop poll during teardown */
++	/*
++	 * Wait for appear to finish. Async cancel_work raced with appear and
++	 * can race teardown. Appearance no longer sends a nested hotplug event.
++	 */
++	cancel_work_sync(&dp->mst_appear_work);
++	atomic_set(&dp->mst_appear_busy, 0);
++	dp->is_mst = false;
++	drm_dp_mst_topology_mgr_set_mst(&dp->mst_mgr, false);
++
++	memset(&dp->link.train, 0, sizeof(dp->link.train));
++	dp->mst_esi_fail_streak = 0;
++	dw_dp_mst_power_put(dp);
++	dp->mst_esi_muted = false;
++	dp->mst_disconnecting = false;
++}
++
++static void dw_dp_mst_appear_work(struct work_struct *work)
++{
++	struct dw_dp *dp = container_of(work, struct dw_dp, mst_appear_work);
++	int ret;
++
++	if (dp->mst_disconnecting) {
++		atomic_set(&dp->mst_appear_busy, 0);
++		return;
++	}
++
++	if (dp->is_mst) {
++		dev_dbg(dp->dev, "MST appear skipped (already up)\n");
++		atomic_set(&dp->mst_appear_busy, 0);
++		return;
++	}
++
++	dev_dbg(dp->dev, "MST appear work: settle/train/set_mst\n");
++	dp->mst_esi_muted = false;
++	dp->mst_esi_fail_streak = 0;
++	ret = dw_dp_mst_power_get(dp);
++	if (ret)
++		goto out_fail;
++	msleep(300);
++	if (dp->mst_disconnecting)
++		goto out_fail;
++
++	dw_dp_link_power_up(dp);
++	ret = dw_dp_link_train(dp);
++	if (ret < 0 || !dw_dp_link_train_valid(&dp->link.train)) {
++		dev_err(dp->dev, "MST appear train failed: %d\n", ret);
++		goto out_fail;
++	}
++	dw_dp_mst_enable(dp);
++	msleep(100);
++	if (dp->mst_disconnecting)
++		goto out_fail;
++
++	/* Probe AUX before LINK_ADDRESS; one unstick if the post-train bus is dead. */
++	{
++		u8 rev;
++
++		ret = drm_dp_dpcd_readb(&dp->aux, DP_DPCD_REV, &rev);
++		if (ret < 0) {
++			dev_warn(dp->dev, "MST appear: pre-set_mst AUX dead (%d), unstick\n",
++				 ret);
++			dw_dp_aux_unstick(dp, "appear pre-set_mst");
++			msleep(50);
++			ret = drm_dp_dpcd_readb(&dp->aux, DP_DPCD_REV, &rev);
++		}
++		if (ret < 0) {
++			dev_err(dp->dev, "MST appear: AUX still dead after unstick (%d)\n",
++				ret);
++			goto out_fail;
++		}
++		dev_dbg(dp->dev, "MST appear: pre-set_mst AUX ok (dpcd=0x%02x)\n", rev);
++	}
++	msleep(200);
++	if (dp->mst_disconnecting)
++		goto out_fail;
++
++	ret = drm_dp_mst_topology_mgr_set_mst(&dp->mst_mgr, true);
++	if (ret < 0) {
++		dev_err(dp->dev, "failed to enable MST: %d\n", ret);
++		goto out_fail;
++	}
++	if (dp->mst_disconnecting)
++		goto out_fail;
++	/* The core discovers ports asynchronously and owns request timeouts. */
++	dp->is_mst = true;
++	atomic_set(&dp->mst_appear_busy, 0);
++	return;
++
++out_fail:
++	/* Train/LINK_ADDRESS fail must not stick is_mst across unplug/replug. */
++	drm_dp_mst_topology_mgr_set_mst(&dp->mst_mgr, false);
++	dp->is_mst = false;
++	memset(&dp->link.train, 0, sizeof(dp->link.train));
++	dw_dp_mst_power_put(dp);
++	atomic_set(&dp->mst_appear_busy, 0);
++}
++
+ static enum drm_connector_status dw_dp_bridge_detect(struct drm_bridge *bridge)
+ {
+ 	struct dw_dp *dp = bridge_to_dp(bridge);
+@@ -5080,25 +5361,31 @@ static enum drm_connector_status dw_dp_bridge_detect(struct drm_bridge *bridge)
+ 	if (status == connector_status_disconnected) {
+ 		kfree(dp->cached_edid);
+ 		dp->cached_edid = NULL;
+-		if (dp->is_mst) {
+-			dev_info(dp->dev, "MST device may have disappeared\n");
+-			dp->is_mst = false;
+-			drm_dp_mst_topology_mgr_set_mst(&dp->mst_mgr, dp->is_mst);
+-			phy_power_off(dp->phy);
++		if (dp->is_mst || atomic_read(&dp->mst_appear_busy)) {
++			dev_dbg(dp->dev, "MST device may have disappeared\n");
++			dw_dp_mst_teardown(dp, "detect disconnect");
+ 		}
+ 	} else if (dp->mst_mgr.cbs) {
+ 		if (dp->link.sink_support_mst) {
+-			dev_info(dp->dev, "MST device appeared\n");
+-			if (!dp->is_mst)
+-				phy_power_on(dp->phy);
+-			dp->is_mst = true;
+-			drm_dp_mst_topology_mgr_set_mst(&dp->mst_mgr, dp->is_mst);
++			/*
++			 * Never train/set_mst/sleep on the detect path — that caused
++			 * appear churn and second-plug freezes on VIA hubs. Schedule
++			 * one serialized appear worker instead.
++			 */
++			if (dp->is_mst) {
++				dev_dbg(dp->dev, "MST already up\n");
++			} else if (dp->mst_disconnecting) {
++				dev_dbg(dp->dev, "MST appear deferred (teardown)\n");
++			} else if (atomic_cmpxchg(&dp->mst_appear_busy, 0, 1) == 0) {
++				dev_dbg(dp->dev, "MST device appeared (queue work)\n");
++				schedule_work(&dp->mst_appear_work);
++			} else {
++				dev_dbg(dp->dev, "MST appear already in flight\n");
++			}
+ 			status = connector_status_disconnected;
+-		} else if (dp->is_mst) {
++		} else if (dp->is_mst || atomic_read(&dp->mst_appear_busy)) {
+ 			dev_info(dp->dev, "SST device appeared\n");
+-			dp->is_mst = false;
+-			drm_dp_mst_topology_mgr_set_mst(&dp->mst_mgr, dp->is_mst);
+-			phy_power_off(dp->phy);
++			dw_dp_mst_teardown(dp, "sst appear");
+ 		}
+ 	}
+ 
+@@ -5589,7 +5876,14 @@ static bool dw_dp_hpd_short_pulse(struct dw_dp *dp)
+ static bool
+ dw_dp_get_sink_irq_esi(struct dw_dp *dp, u8 *esi)
+ {
+-	return drm_dp_dpcd_read(&dp->aux, DP_SINK_COUNT_ESI, esi, 4) == 4;
++	int retry;
++
++	for (retry = 0; retry < 2; retry++) {
++		if (drm_dp_dpcd_read(&dp->aux, DP_SINK_COUNT_ESI, esi, 4) == 4)
++			return true;
++		usleep_range(200, 400);
++	}
++	return false;
+ }
+ 
+ static bool dw_dp_ack_sink_irq_esi(struct dw_dp *dp, u8 esi[4])
+@@ -5608,13 +5902,18 @@ static bool dw_dp_check_mst_status(struct dw_dp *dp)
+ {
+ 	bool link_ok = true;
+ 	bool handled = false;
++	int loops = 0;
+ 
+-	for (;;) {
++	if (dp->mst_esi_muted || dp->mst_disconnecting)
++		return false;
++
++	mutex_lock(&dp->mst_irq_lock);
++	while (loops++ < 8) {
+ 		u8 esi[4] = {};
+ 		u8 ack[4] = {};
+ 
+ 		if (!dw_dp_get_sink_irq_esi(dp, esi)) {
+-			dev_err(dp->dev, "failed to get ESI - device may have failed\n");
++			dev_err_ratelimited(dp->dev, "failed to get ESI - device may have failed\n");
+ 			link_ok = false;
+ 			break;
+ 		}
+@@ -5625,12 +5924,12 @@ static bool dw_dp_check_mst_status(struct dw_dp *dp)
+ 			break;
+ 
+ 		if (!dw_dp_ack_sink_irq_esi(dp, ack))
+-			dev_err(dp->dev, "failed to  ack ESI\n");
++			dev_err_ratelimited(dp->dev, "failed to  ack ESI\n");
+ 
+ 		if (ack[1] & (DP_DOWN_REP_MSG_RDY | DP_UP_REQ_MSG_RDY))
+ 			drm_dp_mst_hpd_irq_send_new_request(&dp->mst_mgr);
+ 	}
+-
++	mutex_unlock(&dp->mst_irq_lock);
+ 	return link_ok;
+ }
+ 
+@@ -5653,6 +5952,16 @@ static void dw_dp_hpd_work(struct work_struct *work)
+ 			phy_power_off(dp->phy);
+ 			return;
+ 		}
++		/*
++		 * Appear owns the link until topo is up. Block retrain (P06f3).
++		 * Defer ESI processing until MST appearance work has settled.
++		 * poll_hpd_irq still services DOWN_REP during set_mst.
++		 */
++		if (atomic_read(&dp->mst_appear_busy)) {
++			dev_dbg(dp->dev, "MST appear: ignore short-HPD (no retrain)\n");
++			phy_power_off(dp->phy);
++			return;
++		}
+ 
+ 		if (dw_dp_hpd_short_pulse(dp)) {
+ 			phy_power_off(dp->phy);
+@@ -6453,9 +6762,14 @@ static int dw_dp_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	mutex_init(&dp->irq_lock);
++	mutex_init(&dp->mst_irq_lock);
+ 	INIT_WORK(&dp->hpd_work, dw_dp_hpd_work);
++	INIT_WORK(&dp->mst_appear_work, dw_dp_mst_appear_work);
++	atomic_set(&dp->mst_appear_busy, 0);
++	dp->mst_disconnecting = false;
++	dp->mst_esi_muted = false;
++	dp->mst_esi_fail_streak = 0;
+ 	INIT_DELAYED_WORK(&dp->hotplug.state_work, dw_dp_gpio_hpd_state_work);
+-	init_completion(&dp->complete);
+ 	init_completion(&dp->hdcp_complete);
+ 
+ 	base = devm_platform_ioremap_resource(pdev, 0);
+@@ -6603,6 +6917,7 @@ static int dw_dp_remove(struct platform_device *pdev)
+ 
+ 	component_del(dp->dev, &dw_dp_component_ops);
+ 	cancel_work_sync(&dp->hpd_work);
++	cancel_work_sync(&dp->mst_appear_work);
+ 	cancel_delayed_work_sync(&dp->hotplug.state_work);
+ 
+ 	return 0;
+-- 
+Armbian
+
