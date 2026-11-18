@@ -1,0 +1,30 @@
+#!/usr/bin/python3
+import hashlib
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+def address(machine_id, interface):
+    if not re.fullmatch(r'[0-9a-f]{32}', machine_id):
+        raise ValueError('A valid machine ID is required.')
+    if not re.fullmatch(r'p2p[0-9]+', interface):
+        raise ValueError('A P2P interface is required.')
+    octets = bytearray(hashlib.blake2s(
+        f'rg-vita-pro:{machine_id}:{interface}'.encode(), digest_size=6).digest())
+    octets[0] = (octets[0] | 2) & 0xfe
+    return ':'.join(f'{value:02x}' for value in octets)
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise SystemExit('Usage: vita-p2p-address p2p0')
+    interface = sys.argv[1]
+    mac = address(Path('/etc/machine-id').read_text().strip(), interface)
+    subprocess.run(['ip', 'link', 'set', 'dev', interface, 'down'], check=True)
+    subprocess.run(['ip', 'link', 'set', 'dev', interface, 'address', mac], check=True)
+
+
+if __name__ == '__main__':
+    main()

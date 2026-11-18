@@ -1,0 +1,7 @@
+[Match]
+Driver=rtw89_8852be
+OriginalName=p2p*
+
+[Link]
+NamePolicy=
+Name=p2p0
