@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hrastovc <hrastovc@gmail.com>
+Date: Wed, 18 Nov 2026 18:00:00 +0100
+Subject: drm/rockchip: refresh MST bandwidth for the current link
+
+---
+ drivers/gpu/drm/rockchip/dw-dp.c | 26 ++++++----
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/gpu/drm/rockchip/dw-dp.c b/drivers/gpu/drm/rockchip/dw-dp.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/rockchip/dw-dp.c
++++ b/drivers/gpu/drm/rockchip/dw-dp.c
+@@ -1151,11 +1151,11 @@ static bool dw_dp_bandwidth_ok(struct dw_dp *dp,
+ {
+ 	u32 max_bw, req_bw;
+ 
+-	if (!rate || !lanes || !mode->clock) {
+-		dev_err_ratelimited(dp->dev, "invalid parameters: rate=%u, lanes=%u, clock=%u\n",
+-			rate, lanes, mode->clock);
++	if (!rate || !lanes)
+ 		return false;
+-	}
++	/* No pixel mode yet (MST appear train): do not block link setup. */
++	if (!mode->clock)
++		return true;
+ 
+ 	req_bw = mode->clock * bpp / 8;
+ 	max_bw = lanes * rate;
+@@ -2459,7 +2459,10 @@ static int dw_dp_link_downgrade(struct dw_dp *dp)
+ 		break;
+ 	}
+ 
+-	if (!dw_dp_bandwidth_ok(dp, &video->mode, video->bpp, link->lanes,
++	dev_info(dp->dev, "link downgrade -> %u MHz (mode_clock=%u)\n",
++		 link->rate / 100, video->mode.clock);
++	if (video->mode.clock &&
++	    !dw_dp_bandwidth_ok(dp, &video->mode, video->bpp, link->lanes,
+ 				link->rate))
+ 		return -E2BIG;
+ 
+@@ -4258,11 +4261,11 @@ static void dw_dp_limit_max_link_rate(struct dw_dp *dp)
+ 	struct dw_dp_link *link = &dp->link;
+ 	struct dw_dp_video *video = &dp->video;
+ 
+-	link->rate = link->max_rate;
+-
+ 	if (dp->is_mst)
+ 		return;
+ 
++	link->rate = link->max_rate;
++
+ 	if (dp->pixel_mode != DPTX_MP_DUAL_PIXEL)
+ 		return;
+ 
+@@ -4562,10 +4565,11 @@ static int dw_dp_mst_encoder_atomic_check(struct drm_encoder *encoder,
+ 	s->tv_state = &conn_state->tv;
+ 	s->color_encoding = DRM_COLOR_YCBCR_BT709;
+ 
+-	if (!mst_state->pbn_div) {
+-		mst_state->pbn_div = drm_dp_get_vc_payload_bw(&dp->mst_mgr, dp->link.rate,
+-							      dp->link.lanes);
+-	}
++	/* Dock changes can leave the previous link's bandwidth in this state. */
++	mst_state->pbn_div = drm_dp_get_vc_payload_bw(&dp->mst_mgr, dp->link.rate,
++						  dp->link.lanes);
++	if (!mst_state->pbn_div)
++		return -EINVAL;
+ 	pbn = drm_dp_calc_pbn_mode(crtc_state->adjusted_mode.crtc_clock, video->bpp, false);
+ 	slot = drm_dp_atomic_find_time_slots(state, &dp->mst_mgr, mst_conn->port, pbn);
+ 	if (slot < 0) {
+-- 
+Armbian
+
