@@ -1,0 +1,15 @@
+#!/bin/bash
+# Wait for USB-C PD/MST to finish initial chatter before the display manager
+# starts. Plugging the dock at power-on otherwise races GNOME into dw-dp MST
+# setup and can hard-freeze the SoC (no ping/SSH).
+set -e
+deadline=$((SECONDS + 25))
+while (( SECONDS < deadline )); do
+	if [[ -e /sys/class/typec/port0/port0-partner ]]; then
+		# Partner present: give TCPM + dw-dp a moment to finish Enter Mode.
+		sleep 4
+		exit 0
+	fi
+	sleep 0.5
+done
+exit 0

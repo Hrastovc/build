@@ -1,0 +1,5 @@
+# Let NetworkManager manage all devices (GNOME WiFi UI, nmcli, etc.).
+# See extensions/network/config-nm/netplan/00-default-use-network-manager.yaml
+network:
+  version: 2
+  renderer: NetworkManager
