@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: crackerjacques <jack@supremeoverlordjabs.co>
+Date: Wed, 29 Jul 2026 19:19:21 +0200
+Subject: power: supply: sgm41542: fix charger startup and cleanup
+
+Start charging when VBUS is present at boot and release resources on removal.
+
+Signed-off-by: crackerjacques <jack@supremeoverlordjabs.co>
+---
+diff --git a/drivers/power/supply/sgm41542_charger.c b/drivers/power/supply/sgm41542_charger.c
+--- a/drivers/power/supply/sgm41542_charger.c
++++ b/drivers/power/supply/sgm41542_charger.c
+@@ -822,6 +822,27 @@
+ 	device_create_file(dev, &dev_attr_registers);
+ }
+ 
++static int sgm4154x_config_input_curr_lim(struct sgm4154x_device *sgm)
++{
++	int ilim;
++
++	switch (sgm->state.chrg_type) {
++	case SGM4154x_USB_SDP:
++		ilim = DEFAULT_INPUT_CURRENT;
++		break;
++	case SGM4154x_USB_CDP:
++		ilim = 1500000;
++		break;
++	case SGM4154x_USB_DCP:
++	default:
++		/* DCP, USB PD or another non-BC1.2 source: use the full limit */
++		ilim = SGM4154x_IINDPM_DEF_uA;
++		break;
++	}
++
++	return sgm4154x_set_input_curr_lim(sgm, ilim);
++}
++
+ static irqreturn_t sgm4154x_irq_handler_thread(int irq, void *private)
+ {
+ 	struct sgm4154x_device *sgm4154x = private;
+@@ -925,47 +946,35 @@
+ static int sgm4154x_hw_init(struct sgm4154x_device *sgm)
+ {
+ 	struct power_supply_battery_info *bat_info;
+-	int chrg_stat, ret = 0;
++	bool release_bat_info = false;
++	int chrg_stat, ret;
+ 
+ 	ret = power_supply_get_battery_info(sgm->charger, &bat_info);
+ 	if (ret) {
+-		/* Allocate an empty battery */
+ 		bat_info = devm_kzalloc(sgm->dev, sizeof(*bat_info), GFP_KERNEL);
+ 		if (!bat_info)
+ 			return -ENOMEM;
+ 		pr_info("sgm4154x: no battery information is supplied\n");
+-		/*
+-		 * If no battery information is supplied, we should set
+-		 * default charge termination current to 120 mA, and default
+-		 * charge termination voltage to 4.35V.
+-		 */
+-		bat_info->constant_charge_current_max_ua =
+-			SGM4154x_ICHRG_I_DEF_uA;
+-		bat_info->constant_charge_voltage_max_uv =
+-			SGM4154x_VREG_V_DEF_uV;
+-		bat_info->precharge_current_ua =
+-			SGM4154x_PRECHRG_I_DEF_uA;
+-		bat_info->charge_term_current_ua =
+-			SGM4154x_TERMCHRG_I_DEF_uA;
+-		sgm->init_data.max_ichg =
+-			SGM4154x_ICHRG_I_MAX_uA;
++		bat_info->constant_charge_current_max_ua = SGM4154x_ICHRG_I_DEF_uA;
++		bat_info->constant_charge_voltage_max_uv = SGM4154x_VREG_V_DEF_uV;
++		bat_info->precharge_current_ua = SGM4154x_PRECHRG_I_DEF_uA;
++		bat_info->charge_term_current_ua = SGM4154x_TERMCHRG_I_DEF_uA;
++		sgm->init_data.max_ichg = SGM4154x_ICHRG_I_MAX_uA;
+ 		sgm->init_data.max_vreg = SGM4154x_VREG_V_DEF_uV;
+-	}
++	} else {
++		release_bat_info = true;
++	}
++
+ 	if (!bat_info->constant_charge_current_max_ua)
+-		bat_info->constant_charge_current_max_ua =
+-					SGM4154x_ICHRG_I_MAX_uA;
++		bat_info->constant_charge_current_max_ua = SGM4154x_ICHRG_I_MAX_uA;
+ 	if (!bat_info->constant_charge_voltage_max_uv)
+-		bat_info->constant_charge_voltage_max_uv =
+-			SGM4154x_VREG_V_DEF_uV;
++		bat_info->constant_charge_voltage_max_uv = SGM4154x_VREG_V_DEF_uV;
+ 	if (!bat_info->precharge_current_ua)
+-		bat_info->precharge_current_ua =
+-			SGM4154x_PRECHRG_I_DEF_uA;
++		bat_info->precharge_current_ua = SGM4154x_PRECHRG_I_DEF_uA;
+ 	if (!bat_info->charge_term_current_ua)
+-		bat_info->charge_term_current_ua =
+-			SGM4154x_TERMCHRG_I_DEF_uA;
++		bat_info->charge_term_current_ua = SGM4154x_TERMCHRG_I_DEF_uA;
+ 	if (!sgm->init_data.max_ichg)
+-		sgm->init_data.max_ichg =
+-			SGM4154x_ICHRG_I_MAX_uA;
++		sgm->init_data.max_ichg = SGM4154x_ICHRG_I_MAX_uA;
+ 
+ 	if (bat_info->constant_charge_voltage_max_uv)
+ 		sgm->init_data.max_vreg = bat_info->constant_charge_voltage_max_uv;
+@@ -974,18 +983,15 @@
+ 	if (ret)
+ 		goto err_out;
+ 
+-
+ 	ret = sgm4154x_set_prechrg_curr(sgm, bat_info->precharge_current_ua);
+ 	if (ret)
+ 		goto err_out;
+ 
+-	ret = sgm4154x_set_chrg_volt(sgm,
+-				     sgm->init_data.max_vreg);
++	ret = sgm4154x_set_chrg_volt(sgm, sgm->init_data.max_vreg);
+ 	if (ret)
+ 		goto err_out;
+ 
+-	ret = sgm4154x_set_term_curr(sgm,
+-				     bat_info->charge_term_current_ua);
++	ret = sgm4154x_set_term_curr(sgm, bat_info->charge_term_current_ua);
+ 	if (ret)
+ 		goto err_out;
+ 
+@@ -998,15 +1004,16 @@
+ 		pr_err("read SGM4154x_CHRG_STAT fail\n");
+ 		goto err_out;
+ 	}
++
++	ret = sgm4154x_set_ichrg_curr(sgm,
++		      bat_info->constant_charge_current_max_ua);
++	if (ret)
++		goto err_out;
+ 
+ 	if (!(chrg_stat & SGM4154x_PG_STAT)) {
+ 		ret = sgm4154x_set_input_curr_lim(sgm, DEFAULT_INPUT_CURRENT);
+ 		if (ret)
+ 			goto err_out;
+-		ret = sgm4154x_set_ichrg_curr(sgm,
+-			      bat_info->constant_charge_current_max_ua);
+-		if (ret)
+-			goto err_out;
+ 
+ 		ret = sgm4154x_disable_charger(sgm);
+ 		if (ret)
+@@ -1016,10 +1023,7 @@
+ 	if (ret)
+ 		goto err_out;
+ 
+-	regmap_update_bits(sgm->regmap,
+-			   SGM4154x_CHRG_CTRL_d,
+-			   0x01,
+-			   0x00);
++	regmap_update_bits(sgm->regmap, SGM4154x_CHRG_CTRL_d, 0x01, 0x00);
+ 
+ 	regmap_update_bits(sgm->regmap,
+ 			   SGM4154x_CHRG_CTRL_a,
+@@ -1030,7 +1034,6 @@
+ 			   SGM4154x_CHRG_CTRL_a,
+ 			   SGM4154x_VINDPM_INT_MASK,
+ 			   SGM4154x_VINDPM_INT_DIS);
+-
+ 
+ 	ret = sgm4154x_set_recharge_volt(sgm, 200);
+ 	if (ret)
+@@ -1047,9 +1050,13 @@
+ 	    bat_info->charge_term_current_ua,
+ 	    sgm->init_data.ilim);
+ 
++	if (release_bat_info)
++		power_supply_put_battery_info(sgm->charger, bat_info);
+ 	return 0;
+ 
+ err_out:
++	if (release_bat_info)
++		power_supply_put_battery_info(sgm->charger, bat_info);
+ 	return ret;
+ }
+ 
+@@ -1287,8 +1294,7 @@
+ 	sgm->dev = dev;
+ 
+ 	mutex_init(&sgm->lock);
+-
+-	strncpy(sgm->model_name, id->name, I2C_NAME_SIZE);
++	strscpy(sgm->model_name, id->name, sizeof(sgm->model_name));
+ 
+ 	sgm->regmap = devm_regmap_init_i2c(client, &sgm4154x_regmap_config);
+ 	if (IS_ERR(sgm->regmap)) {
+@@ -1307,7 +1313,7 @@
+ 	ret = sgm4154x_hw_chipid_detect(sgm);
+ 	if ((ret & SGM4154x_PN_MASK) != SGM4154x_PN_ID) {
+ 		pr_info("[%s] device not found !\n", __func__);
+-		return ret;
++		return -ENODEV;
+ 	}
+ 
+ 	device_init_wakeup(dev, 1);
+@@ -1342,24 +1348,42 @@
+ 	ret = sgm4154x_set_otg_voltage(sgm, 5000000);
+ 	if (ret) {
+ 		dev_err(sgm->dev, "set OTG voltage error!\n");
+-		return ret;
++		goto error_out;
+ 	}
+ 
+ 	ret = sgm4154x_set_otg_current(sgm, 1200000);
+ 	if (ret) {
+ 		dev_err(sgm->dev, "set OTG current error!\n");
+-		return ret;
++		goto error_out;
+ 	}
+ 
+ 	sgm->sgm_monitor_wq = alloc_ordered_workqueue("%s",
+ 			WQ_MEM_RECLAIM | WQ_FREEZABLE, "sgm-monitor-wq");
++	if (!sgm->sgm_monitor_wq) {
++		dev_err(dev, "Failed to create monitor workqueue\n");
++		ret = -ENOMEM;
++		goto error_out;
++	}
+ 	INIT_DELAYED_WORK(&sgm->sgm_delay_work, sgm_charger_work);
+ 
+ 	sgm4154x_vbus_regulator_register(sgm);
+ 	sgm4154x_create_device_node(sgm->dev);
+-	return ret;
++
++	/*
++	 * Configure and enable charging now if VBUS was already present at probe
++	 * time - no attach interrupt will arrive to do it for us, and the input
++	 * current limit would otherwise stay at the 500mA USB default.
++	 */
++	ret = sgm4154x_get_state(sgm, &sgm->state);
++	if (!ret && sgm->state.vbus_gd) {
++		sgm4154x_config_input_curr_lim(sgm);
++		sgm4154x_enable_charger(sgm);
++	}
++
++	return 0;
++
+ error_out:
+-
++	unregister_pm_notifier(&sgm->pm_nb);
+ 	return ret;
+ }
+ 
+@@ -1367,9 +1391,9 @@
+ {
+ 	struct sgm4154x_device *sgm = i2c_get_clientdata(client);
+ 
++	unregister_pm_notifier(&sgm->pm_nb);
++	cancel_delayed_work_sync(&sgm->sgm_delay_work);
+ 	destroy_workqueue(sgm->sgm_monitor_wq);
+-	regulator_unregister(sgm->otg_rdev);
+-	power_supply_unregister(sgm->charger);
+ 	mutex_destroy(&sgm->lock);
+ }
+ 
