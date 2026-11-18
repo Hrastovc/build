@@ -1,0 +1,53 @@
+#!/usr/bin/python3
+import argparse
+from pathlib import Path
+
+
+def valid_edid(edid):
+    return (len(edid) >= 128 and edid[:8] == b'\x00\xff\xff\xff\xff\xff\xff\x00'
+            and len(edid) == (edid[126] + 1) * 128
+            and all(sum(edid[offset:offset + 128]) % 256 == 0
+                    for offset in range(0, len(edid), 128)))
+
+
+def p2213_profile(edid):
+    if not valid_edid(edid):
+        raise ValueError('The input EDID is invalid.')
+    if edid[8:12] != bytes.fromhex('10ac42f0'):
+        raise ValueError('The preset requires a Dell P2213.')
+    if edid[12:16] == bytes(4):
+        raise ValueError('The preset requires a unique monitor serial.')
+    profile = bytearray(edid)
+    # Native pixels at 59.949 Hz with a 125 MHz clock.
+    profile[54:66] = bytes.fromhex('d43090f0601a244030203600')
+    profile[71] = 0x1a
+    profile[127] = (-sum(profile[:127])) & 0xff
+    return bytes(profile)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Create a monitor-specific EDID profile.')
+    parser.add_argument('input', type=Path, help='Captured EDID or connector EDID path')
+    parser.add_argument('output', type=Path, help='New profile path')
+    parser.add_argument('--p2213-125mhz', action='store_true',
+                        help='Apply the tested P2213 timing for two-lane triple display')
+    args = parser.parse_args()
+    edid = args.input.read_bytes()
+    if not valid_edid(edid):
+        parser.error('The input EDID is invalid.')
+    if not any(edid[12:16]):
+        parser.error('The profile requires a unique monitor serial.')
+    if args.p2213_125mhz:
+        if not args.output.name.endswith('.force.bin'):
+            parser.error('Use a .force.bin filename for a custom timing profile.')
+        try:
+            edid = p2213_profile(edid)
+        except ValueError as error:
+            parser.error(str(error))
+    with args.output.open('xb') as target:
+        target.write(edid)
+    print(f'Saved {args.output}')
+
+
+if __name__ == '__main__':
+    main()

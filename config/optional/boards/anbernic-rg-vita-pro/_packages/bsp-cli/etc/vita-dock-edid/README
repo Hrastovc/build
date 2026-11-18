@@ -1,0 +1,9 @@
+Save verified EDID profiles as /etc/vita-dock-edid/*.bin.
+Save build profiles in $USERPATCHES_PATH/vita-dock-edid/.
+The service matches manufacturer, product, and serial bytes.
+The service restores a profile when its preferred resolution is absent.
+Name tested custom timing profiles *.force.bin to replace a matching EDID regardless of available resolutions.
+Save matching layout settings in /etc/vita-dock-displays.conf.
+Save build layout settings as $USERPATCHES_PATH/vita-dock-displays.conf.
+Run systemctl restart vita-dock-edid.service after changing profiles.
+Remove profiles and reconnect the hub to undo the override.

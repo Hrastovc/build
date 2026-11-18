@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore missing monitor modes
+After=systemd-udevd.service
+ConditionPathExistsGlob=/etc/vita-dock-edid/*.bin
+
+[Service]
+ExecStart=/usr/bin/vita-dock-edid-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

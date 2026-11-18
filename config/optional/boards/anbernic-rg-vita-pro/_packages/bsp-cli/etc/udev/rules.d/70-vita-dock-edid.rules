@@ -1,0 +1,1 @@
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", ACTION=="change", ENV{SYNTH_ARG_VITAEDID}=="1", ENV{HOTPLUG}="1"

@@ -1,0 +1,270 @@
+#!/bin/bash
+# Apply USB-C MST (and optional HDMI) display layouts after login.
+# GNOME may restore monitors.xml with externals disabled; boot can race MST.
+#
+# Enable the monitor with the highest native resolution first.
+set -euo pipefail
+
+[ "${XDG_SESSION_TYPE:-}" = "wayland" ] || exit 0
+command -v gdctl >/dev/null 2>&1 || exit 0
+[ -n "${XDG_RUNTIME_DIR:-}" ] || exit 0
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+[ -r /etc/default/vita-dock-displays ] && . /etc/default/vita-dock-displays
+[ -r /etc/vita-dock-displays.conf ] && . /etc/vita-dock-displays.conf
+[ -r "${HOME}/.config/vita-dock-displays.conf" ] && . "${HOME}/.config/vita-dock-displays.conf"
+# Command-line / environment overrides (after defaults file).
+MODE="${VITA_DOCK_MODE:-${MODE:-auto}}"
+REQUIRE_DOCK="${VITA_DOCK_REQUIRE_DOCK:-${REQUIRE_DOCK:-1}}"
+DUAL_HI_MODE="${VITA_DOCK_DUAL_HI:-${DUAL_HI_MODE:-${DUAL_EXT2_MODE:-auto}}}"
+DUAL_LO_MODE="${VITA_DOCK_DUAL_LO:-${DUAL_LO_MODE:-${DUAL_EXT1_MODE:-auto}}}"
+TRIPLE_EXT_MODE="${VITA_DOCK_TRIPLE_EXT:-${TRIPLE_EXT_MODE:-auto}}"
+TRIPLE_HI_MODE="${VITA_DOCK_TRIPLE_HI:-${TRIPLE_HI_MODE:-$TRIPLE_EXT_MODE}}"
+TRIPLE_MID_MODE="${VITA_DOCK_TRIPLE_MID:-${TRIPLE_MID_MODE:-$TRIPLE_EXT_MODE}}"
+TRIPLE_LO_MODE="${VITA_DOCK_TRIPLE_LO:-${TRIPLE_LO_MODE:-$TRIPLE_EXT_MODE}}"
+PANEL_MODE="${VITA_DOCK_PANEL_MODE:-${PANEL_MODE:-auto}}"
+PANEL_SCALE="${VITA_DOCK_PANEL_SCALE:-${PANEL_SCALE:-auto}}"
+PERSIST="${VITA_DOCK_PERSIST:-${PERSIST:-0}}"
+DISABLE="${VITA_DOCK_DISABLE:-${DISABLE:-1}}"
+VERIFY_ONLY=0
+[ "${1:-}" != --verify-only ] || VERIFY_ONLY=1
+if [ "${1:-}" = --check-enabled ]; then
+	[ "${DISABLE:-1}" != 1 ]
+	exit $?
+fi
+[ "${DISABLE:-1}" = "1" ] && exit 0
+
+LOG="${XDG_RUNTIME_DIR}/vita-dock-displays.log"
+exec >"$LOG" 2>&1
+echo "vita-dock-displays start $(date -Is) MODE=$MODE"
+
+if [ "$REQUIRE_DOCK" = "1" ]; then
+	# Login often races dock plug; wait before giving up.
+	deadline=$((SECONDS + 90))
+	while [ ! -e /sys/class/typec/port0/port0-partner ]; do
+		(( SECONDS < deadline )) || { echo "no Type-C partner; exit"; exit 0; }
+		sleep 2
+	done
+fi
+
+drm_enabled() {
+	local conn="$1" p
+	for p in /sys/class/drm/card*-"${conn}"/enabled; do
+		[ -f "$p" ] || continue
+		[ "$(cat "$p")" = enabled ] && return 0
+	done
+	return 1
+}
+
+all_dp_enabled() {
+	local c
+	for c in "$@"; do
+		drm_enabled "$c" || return 1
+	done
+	return 0
+}
+
+# Keep intermediate layouts temporary. GNOME confirms persistent layouts.
+apply_gdctl_temp() {
+	echo "gdctl (temp): $*"
+	set +e
+	gdctl set "$@"
+	local rc=$?
+	echo "gdctl rc=$rc"
+	set -e
+	return "$rc"
+}
+
+apply_gdctl_final() {
+	if [ "$PERSIST" != "1" ]; then
+		apply_gdctl_temp "$@"
+		return $?
+	fi
+	echo "gdctl (persistent; confirm in GNOME): $*"
+	set +e
+	gdctl set -P "$@"
+	local rc=$?
+	echo "gdctl rc=$rc"
+	set -e
+	return "$rc"
+}
+
+wait_drm() {
+	local deadline=$((SECONDS + 120))
+	while (( SECONDS < deadline )); do
+		gdctl show >/dev/null 2>&1 && return 0
+		sleep 2
+	done
+	return 1
+}
+
+wait_drm || { echo "gdctl not ready"; exit 0; }
+sleep 3
+
+readarray -t INFO < <(python3 - <<'PYMODES'
+from gi.repository import Gio
+import re
+
+proxy = Gio.DBusProxy.new_for_bus_sync(
+    Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, None,
+    'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+    'org.gnome.Mutter.DisplayConfig', None)
+_, monitors, _, _ = proxy.call_sync(
+    'GetCurrentState', None, Gio.DBusCallFlags.NO_AUTO_START, 5000, None).unpack()
+preferred = {}
+dp = []
+hdmi = False
+for spec, modes, properties in monitors:
+    connector = spec[0]
+    if not modes:
+        continue
+    mode = next((m for m in modes if m[6].get('is-preferred')), modes[0])
+    preferred[connector] = (mode[0], mode[4])
+    if re.fullmatch(r'DP-\d+', connector):
+        dp.append((mode[1] * mode[2], connector))
+    elif connector == 'HDMI-A-1':
+        hdmi = True
+dp.sort(reverse=True)
+print(len(dp))
+print('yes' if hdmi else 'no')
+for _, connector in dp:
+    print(connector)
+print('MODES')
+for connector, (mode, scale) in preferred.items():
+    print(f'{connector} {mode} {scale}')
+PYMODES
+)
+
+dp_count="${INFO[0]:-0}"
+hdmi_on="${INFO[1]:-no}"
+DP_CONNS=("${INFO[@]:2:dp_count}")
+declare -A PREFERRED_MODES=() PREFERRED_SCALES=()
+for row in "${INFO[@]:$((dp_count + 3))}"; do
+	read -r conn mode scale <<< "$row"
+	PREFERRED_MODES["$conn"]=$mode
+	PREFERRED_SCALES["$conn"]=$scale
+done
+
+resolve_mode() {
+	local connector=$1 requested=$2
+	if [ "$requested" = auto ]; then
+		printf '%s\n' "${PREFERRED_MODES[$connector]:?No preferred mode}"
+	else
+		printf '%s\n' "$requested"
+	fi
+}
+
+PANEL_MODE=$(resolve_mode DSI-1 "$PANEL_MODE")
+if [ "$PANEL_SCALE" = auto ]; then
+	PANEL_SCALE=${PREFERRED_SCALES[DSI-1]:-1.0}
+fi
+
+echo "dp_count=$dp_count hdmi=$hdmi_on conns=${DP_CONNS[*]}"
+
+if [ "$dp_count" -lt 1 ] && [ "$hdmi_on" != "yes" ]; then
+	echo "nothing to configure"
+	exit 0
+fi
+
+case "$MODE" in
+external-only) MODE=triple ;;
+esac
+
+if [ "$MODE" = "auto" ]; then
+	if [ "$hdmi_on" = "yes" ] && [ "$dp_count" -ge 2 ]; then
+		MODE=hdmi-combo
+	elif [ "$dp_count" -ge 3 ]; then
+		MODE=triple
+	elif [ "$dp_count" -ge 2 ]; then
+		MODE=dual
+	else
+		echo "auto: only one DP; leave GNOME layout"
+		exit 0
+	fi
+	echo "auto picked MODE=$MODE"
+fi
+
+case "$MODE" in
+dual)
+	[ "$dp_count" -ge 2 ] || { echo "dual needs 2 DP"; exit 0; }
+	hi="${DP_CONNS[0]}"
+	lo="${DP_CONNS[1]}"
+	DUAL_HI_MODE=$(resolve_mode "$hi" "$DUAL_HI_MODE")
+	DUAL_LO_MODE=$(resolve_mode "$lo" "$DUAL_LO_MODE")
+	echo "hi=$hi ($DUAL_HI_MODE) lo=$lo ($DUAL_LO_MODE)"
+
+	APPLY_ARGS=(
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE"
+		-L -M "$hi" --mode "$DUAL_HI_MODE" --scale 1.0 --right-of DSI-1
+		-L -M "$lo" --mode "$DUAL_LO_MODE" --scale 1.0 --right-of "$hi"
+	)
+	# Preserve the current layout when a requested mode is unavailable.
+	gdctl set --verify "${APPLY_ARGS[@]}" || exit 1
+	[ "$VERIFY_ONLY" != 1 ] || exit 0
+
+	# Phase 1–2: temporary only (do not save / arm Keep dialog).
+	apply_gdctl_temp \
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE" || true
+	sleep 3
+	apply_gdctl_temp \
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE" \
+		-L -M "$hi" --mode "$DUAL_HI_MODE" --scale 1.0 --right-of DSI-1 || true
+	sleep 3
+
+	apply_gdctl_final "${APPLY_ARGS[@]}" || true
+	sleep 2
+	if ! all_dp_enabled "$hi" "$lo"; then
+		echo "retry phase 3"
+		apply_gdctl_final "${APPLY_ARGS[@]}"
+	fi
+	all_dp_enabled "$hi" "$lo" || exit 1
+	;;
+triple)
+	[ "$dp_count" -ge 3 ] || { echo "triple needs 3 DP (have $dp_count)"; exit 0; }
+	ext1="${DP_CONNS[0]}"
+	ext2="${DP_CONNS[1]}"
+	ext3="${DP_CONNS[2]}"
+	TRIPLE_HI_MODE=$(resolve_mode "$ext1" "$TRIPLE_HI_MODE")
+	TRIPLE_MID_MODE=$(resolve_mode "$ext2" "$TRIPLE_MID_MODE")
+	TRIPLE_LO_MODE=$(resolve_mode "$ext3" "$TRIPLE_LO_MODE")
+	APPLY_ARGS=(
+		-L -M "$ext1" --mode "$TRIPLE_HI_MODE" --primary --scale 1.0
+		-L -M "$ext2" --mode "$TRIPLE_MID_MODE" --scale 1.0 --right-of "$ext1"
+		-L -M "$ext3" --mode "$TRIPLE_LO_MODE" --scale 1.0 --right-of "$ext2"
+	)
+	gdctl set --verify "${APPLY_ARGS[@]}" || exit 1
+	[ "$VERIFY_ONLY" != 1 ] || exit 0
+	apply_gdctl_temp \
+		-L -M DSI-1 --mode "$PANEL_MODE" --primary --scale "$PANEL_SCALE"
+	sleep 3
+	apply_gdctl_temp \
+		-L -M "$ext1" --mode "$TRIPLE_HI_MODE" --primary --scale 1.0
+	sleep 3
+	apply_gdctl_temp \
+		-L -M "$ext1" --mode "$TRIPLE_HI_MODE" --primary --scale 1.0 \
+		-L -M "$ext2" --mode "$TRIPLE_MID_MODE" --scale 1.0 --right-of "$ext1"
+	sleep 3
+	apply_gdctl_final "${APPLY_ARGS[@]}"
+	sleep 2
+	all_dp_enabled "$ext1" "$ext2" "$ext3" || exit 1
+	;;
+hdmi-combo)
+	[ "$hdmi_on" = "yes" ] || { echo "hdmi-combo needs HDMI"; exit 0; }
+	[ "$dp_count" -ge 2 ] || { echo "hdmi-combo needs 2 DP"; exit 0; }
+	ext1="${DP_CONNS[0]}"
+	ext2="${DP_CONNS[1]}"
+	TRIPLE_EXT_MODE=$(resolve_mode HDMI-A-1 "$TRIPLE_EXT_MODE")
+	combo1=$(resolve_mode "$ext1" auto)
+	combo2=$(resolve_mode "$ext2" auto)
+	apply_gdctl_final \
+		-L -M HDMI-A-1 --mode "$TRIPLE_EXT_MODE" --primary --scale 1.0 \
+		-L -M "$ext1" --mode "$combo1" --scale 1.0 --right-of HDMI-A-1 \
+		-L -M "$ext2" --mode "$combo2" --scale 1.0 --right-of "$ext1" || true
+	;;
+*)
+	echo "unknown MODE=$MODE"
+	exit 1
+	;;
+esac
+
+echo "done"

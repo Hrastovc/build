@@ -1,0 +1,112 @@
+#!/usr/bin/python3
+import os
+from pathlib import Path
+import re
+import time
+import uuid
+
+
+PROFILE_DIR = Path('/etc/vita-dock-edid')
+
+
+def valid_edid(edid):
+    return (len(edid) >= 128 and len(edid) == 128 * (edid[126] + 1)
+            and edid[:8] == b'\x00\xff\xff\xff\xff\xff\xff\x00'
+            and all(sum(edid[i:i + 128]) % 256 == 0
+                    for i in range(0, len(edid), 128)))
+
+
+def preferred_mode(edid):
+    if not valid_edid(edid) or edid[54:56] == b'\x00\x00':
+        return None
+    width = edid[56] | ((edid[58] >> 4) << 8)
+    height = edid[59] | ((edid[61] >> 4) << 8)
+    return f'{width}x{height}'
+
+
+def load_profiles(directory):
+    profiles = {}
+    for path in sorted(directory.glob('*.bin')):
+        try:
+            edid = path.read_bytes()
+        except OSError as error:
+            print(f'Cannot read {path}: {error}', flush=True)
+            continue
+        if not preferred_mode(edid) or not any(edid[12:16]):
+            print(f'Skip invalid EDID profile: {path}', flush=True)
+            continue
+        profiles[edid[8:16]] = (edid, path.name.endswith('.force.bin'))
+    return profiles
+
+
+def replacement(edid, modes, profiles):
+    if not valid_edid(edid):
+        return None
+    entry = profiles.get(edid[8:16])
+    if entry is None:
+        return None
+    profile, force = entry
+    if force:
+        return profile if edid != profile else None
+    mode = preferred_mode(profile)
+    if mode in modes or mode == preferred_mode(edid):
+        return None
+    return profile
+
+
+def apply_profile(connector, profiles):
+    match = re.fullmatch(r'card(\d+)-(DP-\d+)', connector.name)
+    if not match or (connector / 'status').read_text().strip() != 'connected':
+        return None
+    edid = (connector / 'edid').read_bytes()
+    profile = replacement(edid, (connector / 'modes').read_text().splitlines(), profiles)
+    if profile is None:
+        return None
+    card, name = match.groups()
+    override = Path('/sys/kernel/debug/dri') / card / name / 'edid_override'
+    fd = os.open(override, os.O_WRONLY | os.O_CLOEXEC)
+    try:
+        if ((connector / 'status').read_text().strip() != 'connected'
+                or (connector / 'edid').read_bytes() != edid):
+            return None
+        if os.write(fd, profile) != len(profile):
+            raise OSError('Incomplete EDID write')
+    finally:
+        os.close(fd)
+    try:
+        (connector / 'status').write_text('detect\n')
+    except OSError as error:
+        print(f'Cannot reprobe {connector.name}: {error}', flush=True)
+    print(f'Restore {preferred_mode(profile)} on {connector.name}', flush=True)
+    return f'card{card}'
+
+
+def main():
+    profiles = load_profiles(PROFILE_DIR)
+    if not profiles:
+        return
+    errors = {}
+    while True:
+        cards = set()
+        for connector in sorted(Path('/sys/class/drm').glob('card*-DP-*')):
+            try:
+                card = apply_profile(connector, profiles)
+                errors.pop(connector.name, None)
+                if card:
+                    cards.add(card)
+            except OSError as error:
+                message = str(error)
+                if errors.get(connector.name) != message:
+                    print(f'EDID correction failed on {connector.name}: {error}', flush=True)
+                    errors[connector.name] = message
+        for card in cards:
+            try:
+                (Path('/sys/class/drm') / card / 'uevent').write_text(
+                    f'change {uuid.uuid4()} VITAEDID=1\n')
+            except OSError as error:
+                print(f'Cannot refresh {card}: {error}', flush=True)
+        time.sleep(1)
+
+
+if __name__ == '__main__':
+    main()

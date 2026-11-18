@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RG Vita Pro dock displays
+Comment=Apply display layouts after monitor connections change
+Exec=/usr/bin/vita-dock-displays-watch
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=GNOME;

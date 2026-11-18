@@ -1,0 +1,13 @@
+# Enable optional GNOME Wayland dock automation with DISABLE=0.
+# Override settings in /etc/vita-dock-displays.conf or ~/.config/vita-dock-displays.conf.
+DISABLE=1
+MODE=auto
+REQUIRE_DOCK=1
+PERSIST=0
+
+# Use compositor preferred modes unless a profile selects explicit modes.
+DUAL_HI_MODE=auto
+DUAL_LO_MODE=auto
+TRIPLE_EXT_MODE=auto
+PANEL_MODE=auto
+PANEL_SCALE=auto
