@@ -107,8 +107,11 @@ user_config__anbernic_rg_vita_pro_dock_packages
                     str(ROOT / 'config/boards/anbernic-rg-vita-pro.conf'),
                     branch, str(package), str(image), str(private)], check=True)
     unit = package / 'etc/systemd/system/multi-user.target.wants/vita-dock-edid.service'
+    setup = package / 'etc/systemd/system/armbian-firstrun-gui.service.d/20-vita-panel.conf'
     if branch == 'vendor':
         assert unit.is_symlink()
+        assert setup.exists()
+        assert (package / 'usr/bin/vita-firstboot-touch').exists()
         assert (package / 'etc/modprobe.d/vita-touch-defer.conf').exists()
         assert (image / 'etc/vita-dock-displays.conf').exists() == configured
         if configured:
@@ -117,6 +120,11 @@ user_config__anbernic_rg_vita_pro_dock_packages
         assert 'mutter-common-bin' in (image / 'packages.txt').read_text()
     else:
         assert not unit.is_symlink()
+        assert not setup.exists()
+        assert not (package / 'usr/bin/vita-firstboot-touch').exists()
+        assert not (package / 'etc/udev/rules.d/99-vita-firstboot-touch.rules').exists()
+        assert not (package / 'etc/systemd/system/gdm.service.d/20-vita-setup-touch.conf').exists()
+        assert not (package / 'etc/systemd/system/gdm3.service.d/20-vita-setup-touch.conf').exists()
         assert not (package / 'etc/modprobe.d/vita-touch-defer.conf').exists()
         assert not (package / 'usr/bin/vita-dock-displays').exists()
         assert not (image / 'etc/vita-dock-displays.conf').exists()

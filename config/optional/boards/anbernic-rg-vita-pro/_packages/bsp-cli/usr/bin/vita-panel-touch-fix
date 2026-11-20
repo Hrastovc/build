@@ -22,7 +22,11 @@ if ! grep -q Synaptics /proc/bus/input/devices 2>/dev/null; then
 	else
 		modprobe rmi_i2c 2>/dev/null || true
 	fi
-	sleep 1
+	# Wait for touch probe completion before panel recovery.
+	for i in $(seq 1 20); do
+		grep -q Synaptics /proc/bus/input/devices 2>/dev/null && break
+		sleep 1
+	done
 fi
 
 echo 1 > "$FB" 2>/dev/null || exit 0

@@ -15,6 +15,9 @@ Build a generic GNOME image:
 Release builds use built-in DRM and USB-DP PHY drivers.
 The development module deployment workflow is not part of the release image.
 
+The first-boot setup uses landscape orientation with matching touch coordinates.
+The desktop retains its normal touch mapping.
+
 ## Storage
 
 The vendor target enables both microSD slots.

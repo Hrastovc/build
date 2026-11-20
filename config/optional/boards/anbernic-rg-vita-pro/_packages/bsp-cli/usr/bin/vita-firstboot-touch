@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+	setup) touch /run/vita-firstboot-touch ;;
+	reset) rm -f /run/vita-firstboot-touch ;;
+	*) exit 2 ;;
+esac
+
+udevadm control --reload-rules
+for event in /sys/class/input/event*; do
+	[ -r "$event/device/name" ] || continue
+	[ "$(cat "$event/device/name")" = "Synaptics BACA281300" ] || continue
+	udevadm trigger --action=change "$event"
+done
+udevadm settle --timeout=10
