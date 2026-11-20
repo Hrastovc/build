@@ -15,6 +15,12 @@ Build a generic GNOME image:
 Release builds use built-in DRM and USB-DP PHY drivers.
 The development module deployment workflow is not part of the release image.
 
+## Storage
+
+The vendor target enables both microSD slots.
+TF1 holds the system card. TF2 provides removable storage.
+The tested device boots from TF1 and reads TF2 at SDR104 speed.
+
 ## Dock displays
 
 The kernel exposes three MST streams.
