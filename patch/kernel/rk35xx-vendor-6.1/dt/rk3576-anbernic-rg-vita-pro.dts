@@ -681,6 +681,7 @@
 		reg = <0x64>;
 		status = "okay";
 		cw,user_rsense = <2000>;
+		monitored-battery = <&battery>;
 		cellwise,battery-profile = [
 			5a 00 00 00 00 00 00 00 ab b5 ae c0 a9 a4 cf af
 			96 ff ff d7 9a 83 70 69 65 65 65 b8 81 d9 af d9

@@ -126,6 +126,7 @@ The vendor kernel supplies the charger and battery gauge drivers.
 The patch series retains charger startup and resource fixes without duplicate driver definitions.
 The charger starts charging when power connects after a battery-only boot.
 The hardware test uses the existing 500 mA input limit.
+The gauge reads nominal capacity from the board's battery data.
 P2P addresses derive from each device's machine ID rather than a shared fixed address.
 
 Test a fresh image on a spare card before replacing an existing installation.
