@@ -124,6 +124,8 @@ The port includes panel, touch, controls, audio, charger, and battery support.
 The amplifier driver remains a separate AW87391 backport.
 The vendor kernel supplies the charger and battery gauge drivers.
 The patch series retains charger startup and resource fixes without duplicate driver definitions.
+The charger starts charging when power connects after a battery-only boot.
+The hardware test uses the existing 500 mA input limit.
 P2P addresses derive from each device's machine ID rather than a shared fixed address.
 
 Test a fresh image on a spare card before replacing an existing installation.

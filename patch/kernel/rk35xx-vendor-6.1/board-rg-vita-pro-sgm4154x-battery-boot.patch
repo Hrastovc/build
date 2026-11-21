@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: hrastovc <hrastovc@gmail.com>
+Date: Sat, 21 Nov 2026 08:43:40 +0100
+Subject: power: supply: sgm41542: keep charging ready after battery boot
+
+A battery-only boot leaves charging disabled after VBUS attachment.
+Keep charging ready so attachment starts charging.
+Charging uses the existing input limits.
+
+OTG takes priority over charging in register 0x01.
+Link: https://www.sg-micro.com/rect/assets/1e8de70b-657e-4156-be68-a64fdbe8e418/SGM41541_SGM41542.pdf
+
+Signed-off-by: hrastovc <hrastovc@gmail.com>
+---
+diff --git a/drivers/power/supply/sgm41542_charger.c b/drivers/power/supply/sgm41542_charger.c
+--- a/drivers/power/supply/sgm41542_charger.c
++++ b/drivers/power/supply/sgm41542_charger.c
+@@ -1015,10 +1015,11 @@
+ 		if (ret)
+ 			goto err_out;
+ 
+-		ret = sgm4154x_disable_charger(sgm);
+-		if (ret)
+-			goto err_out;
+ 	}
++	ret = sgm4154x_enable_charger(sgm);
++	if (ret)
++		goto err_out;
++
+ 	ret = sgm4154x_set_vac_ovp(sgm);
+ 	if (ret)
+ 		goto err_out;
+@@ -1369,16 +1370,10 @@
+ 	sgm4154x_vbus_regulator_register(sgm);
+ 	sgm4154x_create_device_node(sgm->dev);
+ 
+-	/*
+-	 * Configure and enable charging now if VBUS was already present at probe
+-	 * time - no attach interrupt will arrive to do it for us, and the input
+-	 * current limit would otherwise stay at the 500mA USB default.
+-	 */
++	/* Configure the input limit when VBUS is present at probe. */
+ 	ret = sgm4154x_get_state(sgm, &sgm->state);
+-	if (!ret && sgm->state.vbus_gd) {
++	if (!ret && sgm->state.vbus_gd)
+ 		sgm4154x_config_input_curr_lim(sgm);
+-		sgm4154x_enable_charger(sgm);
+-	}
+ 
+ 	return 0;
+ 
