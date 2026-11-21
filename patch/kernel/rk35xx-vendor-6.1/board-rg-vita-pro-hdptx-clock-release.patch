@@ -1,0 +1,27 @@
+From: hrastovc <hrastovc@gmail.com>
+Subject: [PATCH] phy: rockchip: allow clock changes after HDMI powers off
+
+Restore DP pixel clocks after HDMI use.
+Keep rate protection while HDMI is active.
+
+Signed-off-by: hrastovc <hrastovc@gmail.com>
+---
+diff --git a/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c b/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c
+--- a/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c
++++ b/drivers/phy/rockchip/phy-rockchip-samsung-hdptx.c
+@@ -1933,8 +1933,13 @@
+ static int rk_hdptx_phy_power_off(struct phy *phy)
+ {
+ 	struct rk_hdptx_phy *hdptx = phy_get_drvdata(phy);
+-
+-	return rk_hdptx_phy_consumer_put(hdptx, false);
++	int ret;
++
++	ret = rk_hdptx_phy_consumer_put(hdptx, false);
++	if (!ret)
++		hdptx->restrict_rate_change = false;
++
++	return ret;
+ }
+ 
+ static int rk_hdptx_phy_verify_hdmi_config(struct rk_hdptx_phy *hdptx,
