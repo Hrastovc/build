@@ -93,6 +93,8 @@ sudo systemctl restart vita-dock-edid.service
 
 Reconnect the dock after changing the configuration.
 The internal screen returns when the dock disconnects.
+Both HP G5 connector orientations and repeated reconnection pass.
+Switching from direct HDMI to HP G5 preserves all three native modes.
 
 For configured image builds, save profiles under `$USERPATCHES_PATH/vita-dock-edid/`.
 Save the preset as `$USERPATCHES_PATH/vita-dock-displays.conf`.
@@ -102,9 +104,14 @@ Generic builds contain no captured EDIDs or personal monitor settings.
 Remove the profiles and reconnect the dock to undo EDID overrides.
 Set `DISABLE=1` to return layout control to the compositor.
 
-## Other dock results
+## Other display results
 
 HP G5 passes two native external modes with the internal screen active.
+Direct USB-C DP passes P2720D at 2560x1440 in both orientations over four HBR2 lanes.
+Direct HDMI passes P2213 at 1680x1050 through HDMI-to-DVI.
+The first HDMI connection can miss EDID and use a 1080p fallback. Reconnection restores native P2213 detection.
+The tested USB-C-to-HDMI cable with HDMI-to-DVI and DVI cabling produces no picture on P2213.
+
 Fairikabe passes two native modes over four HBR3 lanes in one connector orientation.
 Fairikabe can omit P2720D's native timing when another DVI sink connects.
 Capture a verified native EDID through a direct connection before using a restoration profile.
@@ -115,8 +122,6 @@ Custom `.force.bin` profiles also replace matching EDIDs that contain the same r
 Fairikabe's opposite orientation remains unreliable.
 The second Fairikabe DP-to-HDMI MST hub remains unsupported in the tested cascade.
 DSI shutdown can log command timeouts. The tested dock removal restores the internal screen.
-These results cover the installed test kernel and matching device tree.
-Fresh release images require separate hardware validation.
 
 ## Board validation
 
@@ -129,8 +134,20 @@ The hardware test uses the existing 500 mA input limit.
 The gauge reads nominal capacity from the board's battery data.
 P2P addresses derive from each device's machine ID rather than a shared fixed address.
 
-Test a fresh image on a spare card before replacing an existing installation.
-Validate storage, display, touch, controls, audio, Wi-Fi, Bluetooth, charging, and battery reporting.
-Validate shutdown, reboot, suspend, and wake separately.
+Hardware tests cover RG Vita Pro with GNOME Wayland and the vendor 6.1.172 kernel.
+
+| Function | Validated result |
+|----------|------------------|
+| Boot and storage | Fresh generic image; TF1 boot; TF2 SDR104 read. |
+| Display and touch | First-boot setup, desktop orientation, touch, and dock removal. |
+| Controls | 17 gamepad keys, Home, stick clicks, and four stick axes. |
+| Audio | Internal left/right speakers; MD 44067 A2DP/SBC stereo at 48 kHz. |
+| Network | Wi-Fi, SSH, and Bluetooth pairing. |
+| Power | Nominal 5 Ah reporting, charging after battery boot, shutdown, and reboot. |
+
+Armbian disables suspend by default.
+Opt-in deep and s2idle attempts fail in the RMI4 touch driver.
+The failed attempt leaves touch disabled until reboot.
+Rumble and analog Z/RZ events remain unverified.
 IMU support is not included in this vendor port.
-Radxa Zero 3 W/E tests cover RK3566 regressions, but do not test the RK3576 DisplayPort PHY.
+Other RK35xx boards have no hardware regression results.
